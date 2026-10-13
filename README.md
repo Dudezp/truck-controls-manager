@@ -4,6 +4,20 @@
 
 Повністю переписаний з нуля на базі **CustomTkinter**, без стороннього брендингу, реклами чи донатів. Повна рідна підтримка **української мови** та довільного розміщення папок гри на будь-якому диску.
 
+[![Завантажити](https://img.shields.io/github/v/release/Dudezp/truck-controls-manager?label=%D0%97%D0%B0%D0%B2%D0%B0%D0%BD%D1%82%D0%B0%D0%B6%D0%B8%D1%82%D0%B8&style=for-the-badge&color=0057B7)](https://github.com/Dudezp/truck-controls-manager/releases/latest)
+
+## 📸 Скриншоти
+
+| Профіль і сейви | Твіки гри |
+|:---:|:---:|
+| ![Профіль і сейви](screenshots/1_profile_saves.png) | ![Твіки гри](screenshots/2_tweaks.png) |
+| **Автосортування модів** | **Пошук радіостанцій** |
+| ![Автосортування модів](screenshots/3_mods_autosort.png) | ![Пошук радіостанцій](screenshots/4_radio_search.png) |
+| **Аналіз вильотів** | **Перевірка мережі** |
+| ![Аналіз вильотів](screenshots/5_crash_analyzer.png) | ![Перевірка мережі](screenshots/6_network.png) |
+| **Часті питання (FAQ)** | |
+| ![FAQ](screenshots/7_faq.png) | |
+
 ---
 
 ## 🌟 Можливості програми
