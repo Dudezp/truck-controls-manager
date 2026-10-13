@@ -127,6 +127,7 @@ FAQ_ITEMS = (
     (1, None), (2, None), (3, "tab_tweaks"), (4, "tab_saves"), (5, "tab_controls"), (6, "tab_tweaks"),
     (7, "tab_saves"), (8, "tab_mods"), (9, "tab_mods"), (10, "tab_mods"), (11, "tab_radio"), (12, "tab_radio"),
     (13, "tab_logs"), (14, "tab_logs"), (15, "tab_clean_mods"), (16, None), (17, "tab_settings"),
+    (18, "tab_settings"),
 )
 PRESET_MAX_FILE_SIZE = 10 * 1024 * 1024
 # У Steam Cloud профілів ці елементи лежать у Steam\userdata\...\remote, а не в steam_profiles
@@ -1360,6 +1361,113 @@ def web_search_url(query: str, site: str | None = None) -> str:
     q = f"site:{site} {query}" if site else query
     return "https://www.google.com/search?q=" + urllib.parse.quote_plus(q)
 
+# ============================================================================
+# ОНОВЛЕННЯ ПРОГРАМИ: останній реліз на GitHub
+# ============================================================================
+GITHUB_REPO = "Dudezp/truck-controls-manager"
+RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
+_UPDATE_DOWNLOAD_PREFIX = f"https://github.com/{GITHUB_REPO}/releases/download/"
+
+def parse_version(text: str) -> tuple:
+    return tuple(int(n) for n in re.findall(r'\d+', text or "")[:4]) or (0,)
+
+def is_newer_version(remote: str, local: str) -> bool:
+    a, b = parse_version(remote), parse_version(local)
+    n = max(len(a), len(b))
+    return a + (0,) * (n - len(a)) > b + (0,) * (n - len(b))
+
+def check_for_update(current: str = APP_VERSION, timeout: float = 8) -> dict | None:
+    """Новіший реліз на GitHub або None. Контрольну суму архіву GitHub віддає в полі digest;
+    для старих релізів без нього вона шукається в описі релізу."""
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+        headers={'User-Agent': f'TruckControlsManager/{APP_VERSION}', 'Accept': 'application/vnd.github+json'})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode('utf-8', errors='ignore'))
+    tag = data.get('tag_name') or ""
+    if data.get('draft') or data.get('prerelease') or not is_newer_version(tag, current):
+        return None
+    asset = next((a for a in data.get('assets') or []
+                  if re.search(r'portable.*\.zip$', a.get('name') or "", re.I)), None)
+    sha = None
+    if asset:
+        digest = (asset.get('digest') or "").lower()
+        if re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+            sha = digest[7:]
+        else:
+            m = re.search(re.escape(asset.get('name') or "") + r'[^0-9a-fA-F]{0,40}([0-9a-fA-F]{64})', data.get('body') or "")
+            sha = m.group(1).lower() if m else None
+    url = asset.get('browser_download_url') if asset else None
+    return {'version': tag.lstrip('vV'), 'page': data.get('html_url') or RELEASES_URL,
+            'notes': (data.get('body') or "").strip(), 'name': data.get('name') or tag,
+            'asset_url': url if url and url.startswith(_UPDATE_DOWNLOAD_PREFIX) else None,
+            'asset_name': asset.get('name') if asset else None,
+            'size': int(asset.get('size') or 0) if asset else 0, 'sha256': sha}
+
+def download_update(info: dict, dest_dir: Path, progress=None, cancel=None) -> Path:
+    """Завантажує архів релізу, перевіряє розмір і SHA-256 і дістає з нього exe. Повертає шлях до нового exe."""
+    import hashlib
+    url, sha = info.get('asset_url'), info.get('sha256')
+    if not url or not sha:
+        raise ValueError("no verified download for this release")
+    zpath = dest_dir / "update.zip"
+    h, done = hashlib.sha256(), 0
+    req = urllib.request.Request(url, headers={'User-Agent': f'TruckControlsManager/{APP_VERSION}'})
+    with urllib.request.urlopen(req, timeout=30) as resp, open(zpath, 'wb') as f:
+        while True:
+            if cancel and cancel():
+                raise InterruptedError("cancelled")
+            chunk = resp.read(256 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+            h.update(chunk)
+            done += len(chunk)
+            if progress:
+                progress(done, info.get('size') or 0)
+    if info.get('size') and done != info['size']:
+        raise ValueError(f"size mismatch: {done} != {info['size']}")
+    if h.hexdigest() != sha:
+        raise ValueError("SHA-256 mismatch — the download is damaged or was replaced")
+    with zipfile.ZipFile(zpath) as z:
+        exes = [n for n in z.namelist() if n.lower().endswith('.exe') and '/' not in n and '\\' not in n]
+        if len(exes) != 1:
+            raise ValueError("the archive does not contain the program")
+        new_exe = dest_dir / "TruckControlsManager.new.exe"
+        with z.open(exes[0]) as src, open(new_exe, 'wb') as dst:
+            shutil.copyfileobj(src, dst)
+    with open(new_exe, 'rb') as f:
+        if f.read(2) != b'MZ':
+            raise ValueError("the archive does not contain a Windows program")
+    return new_exe
+
+def install_update(new_exe: Path, current_exe: Path) -> Path:
+    """Ставить новий exe на місце поточного. Запущений exe Windows дозволяє перейменувати (але не перезаписати),
+    тож стара версія лишається поруч як <назва>_previous.exe. Повертає шлях до неї."""
+    backup = current_exe.with_name(current_exe.stem + "_previous" + current_exe.suffix)
+    if backup.exists():
+        backup.unlink()
+    current_exe.rename(backup)
+    try:
+        shutil.copyfile(new_exe, current_exe)
+    except Exception:
+        try:
+            if current_exe.exists():
+                current_exe.unlink()
+        finally:
+            backup.rename(current_exe)
+        raise
+    return backup
+
+def launch_detached(exe: Path):
+    """Запускає exe окремим процесом. PYINSTALLER_RESET_ENVIRONMENT — щоб нова версія не підхопила
+    тимчасову папку поточної (інакше вона запустила б старий код)."""
+    import subprocess
+    env = os.environ.copy()
+    env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    subprocess.Popen([str(exe)], cwd=str(exe.parent), env=env, close_fds=True,
+                     creationflags=0x00000008 | 0x00000200)  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+
 def get_dir_size_str(path: Path) -> str:
     if not path.exists():
         return "0 KB"
@@ -1539,6 +1647,33 @@ LANGUAGES = {
         "btn_radio_check_all": "🔎 Перевірити всі",
         "btn_radio_delete": "🗑 Видалити",
         "btn_radio_reapply": "↺ Мої станції",
+        "upd_btn_header": "⬆ Оновлення {}",
+        "upd_title": "Оновлення програми",
+        "upd_available": "Доступна версія {0} (у вас {1})",
+        "upd_notes": "Що нового:",
+        "upd_install": "⬇ Оновити зараз",
+        "upd_page": "🌐 Сторінка релізу",
+        "upd_skip": "Пропустити цю версію",
+        "upd_later": "Пізніше",
+        "upd_cancel_dl": "Скасувати",
+        "upd_downloading": "Завантаження: {0} з {1}...",
+        "upd_installing": "Встановлюю оновлення і перезапускаю програму...",
+        "upd_failed": "Не вдалося оновити: {}\nЗавантажте нову версію вручну зі сторінки релізу.",
+        "upd_not_frozen": "Оновлення в один клік працює у версії .exe. Якщо ви запускаєте програму з коду, завантажте нову версію зі сторінки релізу.",
+        "upd_no_asset": "Для цього релізу немає перевіреного архіву — завантажте нову версію зі сторінки релізу.",
+        "upd_no_write": "Немає доступу на запис до папки програми ({}). Перенесіть програму в іншу папку або оновіть її вручну.",
+        "upd_hint": "Програма завантажить архів з GitHub, перевірить його контрольну суму SHA-256, замінить себе новою версією і перезапуститься. Попередня версія збережеться поруч як TruckControlsManager_previous.exe, а ваші налаштування не зміняться.",
+        "upd_status_found": "Доступна нова версія {} — натисніть «⬆ Оновлення» вгорі",
+        "upd_card_title": "Оновлення програми",
+        "upd_current": "Встановлена версія: {}",
+        "upd_auto": "Перевіряти оновлення під час запуску",
+        "upd_check_now": "🔄 Перевірити зараз",
+        "upd_checking": "Перевіряю...",
+        "upd_latest": "✓ У вас остання версія ({}).",
+        "upd_found": "Доступна версія {}",
+        "upd_check_failed": "Не вдалося перевірити оновлення: {}",
+        "faq_q18": "Як оновлюється програма?",
+        "faq_a18": "Під час запуску програма тихо перевіряє на GitHub, чи вийшла нова версія. Якщо так, угорі з'являється жовта кнопка «⬆ Оновлення». Натисніть її, перегляньте, що нового, і натисніть «⬇ Оновити зараз»: програма завантажить архів, перевірить його контрольну суму, замінить себе й перезапуститься. Попередня версія лишиться поруч як TruckControlsManager_previous.exe, налаштування збережуться. Перевірку можна вимкнути або запустити вручну в «Налаштуваннях».",
         "btn_faq": "❓ FAQ",
         "faq_title": "Часті питання",
         "faq_search_ph": "Пошук у питаннях і відповідях (наприклад: радіо, вилітає, сейв)...",
@@ -2120,6 +2255,33 @@ LANGUAGES = {
         "btn_radio_check_all": "🔎 Check All",
         "btn_radio_delete": "🗑 Delete",
         "btn_radio_reapply": "↺ My Stations",
+        "upd_btn_header": "⬆ Update {}",
+        "upd_title": "App Update",
+        "upd_available": "Version {0} is available (you have {1})",
+        "upd_notes": "What's new:",
+        "upd_install": "⬇ Update Now",
+        "upd_page": "🌐 Release Page",
+        "upd_skip": "Skip This Version",
+        "upd_later": "Later",
+        "upd_cancel_dl": "Cancel",
+        "upd_downloading": "Downloading: {0} of {1}...",
+        "upd_installing": "Installing the update and restarting...",
+        "upd_failed": "Could not update: {}\nDownload the new version manually from the release page.",
+        "upd_not_frozen": "One-click update works in the .exe version. If you run the app from source, download the new version from the release page.",
+        "upd_no_asset": "This release has no verified archive — download the new version from the release page.",
+        "upd_no_write": "The app folder is not writable ({}). Move the app to another folder or update it manually.",
+        "upd_hint": "The app downloads the archive from GitHub, checks its SHA-256 checksum, replaces itself with the new version and restarts. The previous version is kept next to it as TruckControlsManager_previous.exe, and your settings stay as they are.",
+        "upd_status_found": "New version {} is available — press «⬆ Update» at the top",
+        "upd_card_title": "App Updates",
+        "upd_current": "Installed version: {}",
+        "upd_auto": "Check for updates on start",
+        "upd_check_now": "🔄 Check Now",
+        "upd_checking": "Checking...",
+        "upd_latest": "✓ You have the latest version ({}).",
+        "upd_found": "Version {} is available",
+        "upd_check_failed": "Could not check for updates: {}",
+        "faq_q18": "How does the app update itself?",
+        "faq_a18": "On start the app quietly checks GitHub for a new version. If there is one, a yellow «⬆ Update» button appears at the top. Press it, read what's new and press «⬇ Update Now»: the app downloads the archive, checks its checksum, replaces itself and restarts. The previous version stays next to it as TruckControlsManager_previous.exe and your settings are kept. The check can be turned off or run manually in Settings.",
         "btn_faq": "❓ FAQ",
         "faq_title": "Frequently Asked Questions",
         "faq_search_ph": "Search questions and answers (e.g. radio, crash, save)...",
@@ -3025,6 +3187,169 @@ class RadioSearchDialog(ctk.CTkToplevel):
         self._run(work, done)
 
 
+class UpdateDialog(ctk.CTkToplevel):
+    """Нова версія: що змінилося, оновлення в один клік (завантаження, перевірка SHA-256, заміна exe, перезапуск)."""
+    def __init__(self, master, t, info: dict, on_skip, on_installed):
+        super().__init__(master)
+        self.t, self.info, self.on_skip, self.on_installed = t, info, on_skip, on_installed
+        self._cancel = False
+        self._busy = False
+        self.title(t('upd_title'))
+        self.geometry("760x560")
+        self.minsize(600, 420)
+        self.transient(master)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        ctk.CTkLabel(self, text=f"⬆ {t('upd_available').format(info['version'], APP_VERSION)}", text_color=UA_YELLOW,
+                     font=ctk.CTkFont(family="Segoe UI", size=17, weight="bold")
+                     ).grid(row=0, column=0, padx=18, pady=(16, 2), sticky="w")
+        ctk.CTkLabel(self, text=t('upd_notes'), text_color=COLOR_TEXT_MUTED,
+                     font=ctk.CTkFont(family="Segoe UI", size=12)).grid(row=1, column=0, padx=18, sticky="w")
+        notes = ctk.CTkTextbox(self, corner_radius=10, fg_color="#18191D", wrap="word",
+                               font=ctk.CTkFont(family="Segoe UI", size=12), text_color="#D1D5DB")
+        notes.grid(row=2, column=0, padx=16, pady=6, sticky="nsew")
+        text = re.sub(r'\*\*|`', '', info.get('notes') or "")
+        notes.insert("1.0", re.sub(r'^#+\s*', '', text, flags=re.M) or "—")
+        notes.configure(state="disabled")
+
+        self.lbl_state = ctk.CTkLabel(self, text=self._hint(), text_color=COLOR_TEXT_MUTED, justify="left",
+                                      wraplength=720, font=ctk.CTkFont(family="Segoe UI", size=11))
+        self.lbl_state.grid(row=3, column=0, padx=18, pady=(4, 2), sticky="w")
+        self.progress = ctk.CTkProgressBar(self, progress_color=UA_YELLOW)
+        self.progress.set(0)
+
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.grid(row=5, column=0, padx=16, pady=(6, 16), sticky="ew")
+        self.btn_install = ctk.CTkButton(bar, text=t('upd_install'), height=34, fg_color=UA_YELLOW,
+                                         hover_color=UA_YELLOW_HOVER, text_color=UA_YELLOW_TEXT_DARK,
+                                         command=self.install)
+        self.btn_install.pack(side="left", padx=4)
+        if not self._can_install():
+            self.btn_install.configure(state="disabled")
+        ctk.CTkButton(bar, text=t('upd_page'), height=34, fg_color=UA_BLUE, hover_color=UA_BLUE_HOVER,
+                      command=self.open_page).pack(side="left", padx=4)
+        self.btn_close = ctk.CTkButton(bar, text=t('upd_later'), width=100, height=34, fg_color="#374151",
+                                       hover_color="#4B5563", command=self.close)
+        self.btn_close.pack(side="right", padx=4)
+        self.btn_skip = ctk.CTkButton(bar, text=t('upd_skip'), height=34, fg_color="transparent",
+                                      hover_color="#374151", text_color=COLOR_TEXT_MUTED, command=self.skip)
+        self.btn_skip.pack(side="right", padx=4)
+
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: self.close())
+        self.after(50, self._focus)
+
+    def _focus(self):
+        try:
+            self.grab_set()
+            self.focus_set()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _frozen() -> bool:
+        return bool(getattr(sys, 'frozen', False))
+
+    def _can_install(self) -> bool:
+        return self._frozen() and bool(self.info.get('asset_url') and self.info.get('sha256'))
+
+    def _hint(self) -> str:
+        if not self._frozen():
+            return self.t('upd_not_frozen')
+        if not self._can_install():
+            return self.t('upd_no_asset')
+        return self.t('upd_hint')
+
+    def open_page(self):
+        import webbrowser
+        webbrowser.open(self.info.get('page') or RELEASES_URL)
+
+    def skip(self):
+        if self._busy:
+            return
+        self.on_skip(self.info['version'])
+        self.destroy()
+
+    def close(self):
+        if self._busy:
+            self._cancel = True
+            return
+        self.destroy()
+
+    def _set_state(self, text: str, color=COLOR_TEXT_MUTED):
+        self.lbl_state.configure(text=text, text_color=color)
+
+    def install(self):
+        if self._busy or not self._can_install():
+            return
+        current = Path(sys.executable)
+        try:  # папка програми має бути доступна на запис (не Program Files без прав адміністратора)
+            probe = current.parent / f".tcm_write_test_{os.getpid()}"
+            probe.write_bytes(b"")
+            probe.unlink()
+        except Exception:
+            self._set_state(self.t('upd_no_write').format(current.parent), COLOR_DANGER)
+            return
+        import tempfile
+        tmp = Path(tempfile.mkdtemp(prefix="tcm_update_"))
+        self._busy, self._cancel = True, False
+        self.btn_install.configure(state="disabled")
+        self.btn_skip.configure(state="disabled")
+        self.btn_close.configure(text=self.t('upd_cancel_dl'))
+        self.progress.grid(row=4, column=0, padx=18, pady=(2, 4), sticky="ew")
+        state = {'done': 0, 'total': self.info.get('size') or 0}
+
+        def progress(done, total):
+            state['done'], state['total'] = done, total or state['total']
+
+        def work():
+            try:
+                state['exe'] = download_update(self.info, tmp, progress, lambda: self._cancel)
+            except Exception as e:
+                state['error'] = e
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll():
+            if not self.winfo_exists():
+                return
+            if 'exe' not in state and 'error' not in state:
+                total = state['total']
+                if total:
+                    self.progress.set(min(1.0, state['done'] / total))
+                self._set_state(self.t('upd_downloading').format(fmt_size(state['done']), fmt_size(total)))
+                self.after(150, poll)
+                return
+            self._busy = False
+            self.btn_close.configure(text=self.t('upd_later'))
+            if 'error' in state:
+                shutil.rmtree(tmp, ignore_errors=True)
+                self.progress.grid_remove()
+                self.btn_install.configure(state="normal")
+                self.btn_skip.configure(state="normal")
+                if isinstance(state['error'], InterruptedError):
+                    self._set_state(self._hint())
+                else:
+                    self._set_state(self.t('upd_failed').format(state['error']), COLOR_DANGER)
+                return
+            self.progress.set(1)
+            self._set_state(self.t('upd_installing'))
+            self.update_idletasks()
+            try:
+                install_update(state['exe'], current)
+                launch_detached(current)
+            except Exception as e:
+                self._set_state(self.t('upd_failed').format(e), COLOR_DANGER)
+                self.btn_install.configure(state="normal")
+                self.btn_skip.configure(state="normal")
+                return
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            self.on_installed()
+        self.after(150, poll)
+
+
 class FaqDialog(ctk.CTkToplevel):
     """Часті питання: пошук, відповідь розгортається кліком, кнопка переходу на потрібну вкладку."""
     def __init__(self, master, t, open_tab):
@@ -3408,7 +3733,9 @@ class SettingsManager:
             "language": "uk",
             "theme": "dark",
             "last_game": "Euro Truck Simulator 2",
-            "game_paths": {game: "" for game in GAMES}
+            "game_paths": {game: "" for game in GAMES},
+            "check_updates": True,
+            "skip_version": ""
         }
 
     def _load(self):
@@ -3492,6 +3819,13 @@ class SettingsManager:
         self.data["last_game"] = game
         self.save()
 
+    def get(self, key: str, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key: str, value):
+        self.data[key] = value
+        self.save()
+
 
 class TruckControlsApp(ctk.CTk):
     def __init__(self):
@@ -3529,6 +3863,9 @@ class TruckControlsApp(ctk.CTk):
         # Перевірка знижок Steam
         self.after(500, self.fetch_steam_sales)
         self.after(1000, self._flush_tk_garbage_loop)
+        # Перевірка нової версії на GitHub (тихо, у фоні)
+        if self.settings.get("check_updates", True):
+            self.after(3000, self.start_update_check)
 
     def open_faq(self):
         dlg = FaqDialog(self, self.t, lambda key: self.tabview.set(self.t(key)))
@@ -3664,6 +4001,19 @@ class TruckControlsApp(ctk.CTk):
             command=self.open_faq
         )
         self.btn_faq.pack(side="right", padx=4)
+
+        # З'являється, лише коли на GitHub є новіша версія
+        self.btn_update = ctk.CTkButton(
+            top_controls,
+            text="",
+            height=32,
+            fg_color=UA_YELLOW,
+            hover_color=UA_YELLOW_HOVER,
+            text_color=UA_YELLOW_TEXT_DARK,
+            command=self.open_update_dialog
+        )
+        if getattr(self, 'update_info', None):
+            self._show_update_button()
 
         # 2. Панель гри: вибір гри, статус процесу, запуск; профіль і папка гри
         self.path_card = ctk.CTkFrame(self, corner_radius=12, fg_color=COLOR_CARD_DARK)
@@ -5124,6 +5474,96 @@ class TruckControlsApp(ctk.CTk):
             srv, text=self.t('server_btn'), height=32, fg_color=UA_BLUE, hover_color=UA_BLUE_HOVER,
             command=self.edit_server_config)
         self.btn_server_edit.pack(anchor="w", padx=14, pady=(0, 12))
+
+        # Оновлення програми
+        upd = ctk.CTkFrame(parent, corner_radius=10, fg_color=COLOR_CARD_INNER)
+        upd.grid(row=7, column=0, columnspan=3, padx=16, pady=(4, 16), sticky="ew")
+        ctk.CTkLabel(upd, text=f"⬆ {self.t('upd_card_title')}", text_color=UA_YELLOW,
+                     font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold")).pack(anchor="w", padx=14, pady=(10, 2))
+        ctk.CTkLabel(upd, text=self.t('upd_current').format(APP_VERSION), text_color=COLOR_TEXT_WHITE,
+                     font=ctk.CTkFont(family="Segoe UI", size=12)).pack(anchor="w", padx=14)
+        self.sw_check_updates = ctk.CTkSwitch(upd, text=self.t('upd_auto'), progress_color=UA_BLUE,
+                                              command=lambda: self.settings.set(
+                                                  "check_updates", bool(self.sw_check_updates.get())))
+        if self.settings.get("check_updates", True):
+            self.sw_check_updates.select()
+        self.sw_check_updates.pack(anchor="w", padx=14, pady=8)
+        row = ctk.CTkFrame(upd, fg_color="transparent")
+        row.pack(anchor="w", fill="x", padx=14, pady=(0, 12))
+        self.btn_check_update = ctk.CTkButton(row, text=self.t('upd_check_now'), height=32, fg_color=UA_BLUE,
+                                              hover_color=UA_BLUE_HOVER, command=lambda: self.start_update_check(manual=True))
+        self.btn_check_update.pack(side="left")
+        self.lbl_update_state = ctk.CTkLabel(row, text="", text_color=COLOR_TEXT_MUTED, justify="left",
+                                             font=ctk.CTkFont(family="Segoe UI", size=11))
+        self.lbl_update_state.pack(side="left", padx=12)
+
+    # --- ОНОВЛЕННЯ ПРОГРАМИ ---
+    def _show_update_button(self):
+        self.btn_update.configure(text=self.t('upd_btn_header').format(self.update_info['version']))
+        self.btn_update.pack(side="right", padx=4)
+
+    def start_update_check(self, manual: bool = False):
+        if getattr(self, '_update_checking', False):
+            return
+        self._update_checking = True
+        if manual:
+            self.btn_check_update.configure(state="disabled")
+            self.lbl_update_state.configure(text=self.t('upd_checking'), text_color=COLOR_TEXT_MUTED)
+        box = {}
+
+        def work():
+            try:
+                box['r'] = check_for_update(APP_VERSION)
+            except Exception as e:
+                box['r'] = e
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll():
+            if 'r' not in box:
+                self.after(200, poll)
+                return
+            self._update_checking = False
+            res = box['r']
+            if manual and self.btn_check_update.winfo_exists():
+                self.btn_check_update.configure(state="normal")
+            if isinstance(res, Exception):
+                self.logger.info(f"Update check failed: {res}")
+                if manual:
+                    reason = getattr(res, 'reason', None) or res
+                    self.lbl_update_state.configure(text=self.t('upd_check_failed').format(str(reason)[:80]),
+                                                    text_color=COLOR_DANGER)
+                return
+            if res is None:
+                if manual:
+                    self.lbl_update_state.configure(text=self.t('upd_latest').format(APP_VERSION), text_color="#34D399")
+                return
+            if not manual and res['version'] == self.settings.get("skip_version", ""):
+                return  # користувач попросив пропустити цю версію
+            self.update_info = res
+            self._show_update_button()
+            if manual:
+                self.lbl_update_state.configure(text=self.t('upd_found').format(res['version']), text_color=UA_YELLOW)
+                self.open_update_dialog()
+            else:
+                self.set_status(self.t('upd_status_found').format(res['version']))
+        self.after(200, poll)
+
+    def open_update_dialog(self):
+        info = getattr(self, 'update_info', None)
+        if not info:
+            return
+        dlg = UpdateDialog(self, self.t, info, on_skip=self._skip_update_version, on_installed=self._exit_for_update)
+        self.wait_window(dlg)
+
+    def _skip_update_version(self, version: str):
+        self.settings.set("skip_version", version)
+        self.update_info = None
+        self.btn_update.pack_forget()
+        self._show_ready_status()
+
+    def _exit_for_update(self):
+        self.logger.info("Updated, restarting")
+        self.destroy()
 
     # --- МОНІТОРИНГ ПРОЦЕСУ ГРИ ---
     def check_game_process_loop(self):
