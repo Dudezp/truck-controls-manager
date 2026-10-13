@@ -7086,6 +7086,7 @@ class TruckControlsApp(ctk.CTk):
                 self.after(150, poll)
                 return
             self.btn_mods_sort.configure(state="normal")
+            self._show_ready_status()  # прибрати «Аналізую моди...», якщо перегляд просто закриють
             if isinstance(box['r'], Exception):
                 messagebox.showerror(self.t('dlg_error'), str(box['r']))
                 return
