@@ -1,0 +1,12 @@
+# Збірка
+build/
+dist/
+__pycache__/
+*.pyc
+TruckControlsManager.exe
+TruckControlsManager_v*/
+*_Portable.zip
+
+# Особисті налаштування програми (шляхи до ігор)
+settings.json
+*.log
