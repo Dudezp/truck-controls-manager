@@ -10,3 +10,6 @@ TruckControlsManager_v*/
 # Особисті налаштування програми (шляхи до ігор)
 settings.json
 *.log
+
+# Чернетки постів
+telegram_post.txt
