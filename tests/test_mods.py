@@ -170,6 +170,128 @@ class HashFSTests(unittest.TestCase):
         self.assertEqual(info["display_name"], "Мій мод")
 
 
+class ModImportTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.src = self.dir / "downloads"
+        self.src.mkdir()
+        self.mod_dir = self.dir / "game" / "mod"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def plan(self, *paths):
+        return app.plan_mod_import([str(p) for p in paths], self.mod_dir)
+
+    def test_plan_kinds(self):
+        zmod = self.src / "zipmod.scs"
+        make_zip(zmod, {"manifest.sii": MANIFEST_SII})
+        zdef = self.src / "defonly.zip"
+        make_zip(zdef, {"def/x.sii": "x"})
+        hfs = self.src / "hash.scs"
+        hfs.write_bytes(build_hashfs_v2({"manifest.sii": MANIFEST_SII.encode()}))
+        enc = self.src / "protected.scs"
+        enc.write_bytes(b"AEM!" + b"\0" * 40)
+        box = self.src / "download.zip"
+        make_zip(box, {"readme.txt": "hi", "My Mod v2/my_mod.scs": "a", "my_mod_addon.scs": "b"})
+        folder = self.src / "unpacked"
+        folder.mkdir()
+        (folder / "manifest.sii").write_text(MANIFEST_SII, encoding="utf-8")
+        rar = self.src / "x.rar"
+        rar.write_bytes(b"Rar!")
+        junk = self.src / "notes.zip"
+        make_zip(junk, {"readme.txt": "no mods here"})
+        txt = self.src / "a.txt"
+        txt.write_text("x")
+        plan = self.plan(zmod, zdef, hfs, enc, box, folder, rar, junk, txt, self.src / "gone.scs")
+        got = {(it["dest"].name, it["member"]) for it in plan["items"]}
+        self.assertEqual(got, {("zipmod.scs", None), ("defonly.zip", None), ("hash.scs", None),
+                               ("protected.scs", None), ("my_mod.scs", "My Mod v2/my_mod.scs"),
+                               ("my_mod_addon.scs", "my_mod_addon.scs"), ("unpacked", None)})
+        reasons = {Path(p).name: r for p, r in plan["skipped"]}
+        self.assertEqual(reasons, {"x.rar": "unsupported", "notes.zip": "not_mod", "a.txt": "not_mod",
+                                   "gone.scs": "not_mod"})
+        self.assertTrue(all(it["dest"].parent == self.mod_dir for it in plan["items"]))
+
+    def test_plan_existing_duplicate_and_already_there(self):
+        self.mod_dir.mkdir(parents=True)
+        inside = self.mod_dir / "in.scs"
+        make_zip(inside, {"manifest.sii": MANIFEST_SII})
+        a = self.src / "same.scs"
+        make_zip(a, {"manifest.sii": MANIFEST_SII})
+        sub = self.src / "sub"
+        sub.mkdir()
+        b = sub / "same.scs"
+        make_zip(b, {"manifest.sii": MANIFEST_SII})
+        make_zip(self.mod_dir / "same.scs", {"manifest.sii": MANIFEST_SII})
+        plan = self.plan(inside, a, b)
+        self.assertEqual(len(plan["items"]), 1)
+        self.assertTrue(plan["items"][0]["exists"])
+        self.assertEqual(sorted(r for _p, r in plan["skipped"]), ["already", "duplicate"])
+
+    def test_import_copies_extracts_and_replaces(self):
+        zmod = self.src / "zipmod.scs"
+        make_zip(zmod, {"manifest.sii": MANIFEST_SII})
+        box = self.src / "download.zip"
+        make_zip(box, {"inner/packed.scs": "PACKED"})
+        folder = self.src / "unpacked"
+        (folder / "def").mkdir(parents=True)
+        (folder / "manifest.sii").write_text(MANIFEST_SII, encoding="utf-8")
+        (folder / "def" / "a.sii").write_text("a")
+        self.mod_dir.mkdir(parents=True)
+        (self.mod_dir / "zipmod.scs").write_bytes(b"OLD")
+        recycled = []
+
+        def fake_recycle(paths):
+            for p in paths:
+                recycled.append(Path(p).name)
+                Path(p).unlink()
+            return True
+
+        plan = self.plan(zmod, box, folder)
+        with mock.patch.object(app, "send_to_recycle_bin", side_effect=fake_recycle):
+            done, errors = app.import_mods(plan["items"])
+        self.assertEqual((done, errors), (3, []))
+        self.assertEqual(recycled, ["zipmod.scs"])
+        self.assertEqual((self.mod_dir / "zipmod.scs").read_bytes(), zmod.read_bytes())
+        self.assertEqual((self.mod_dir / "packed.scs").read_bytes(), b"PACKED")
+        self.assertEqual((self.mod_dir / "unpacked" / "def" / "a.sii").read_text(), "a")
+        self.assertEqual(sorted(p.name for p in self.mod_dir.iterdir()), ["packed.scs", "unpacked", "zipmod.scs"])
+
+    def test_import_keeps_old_file_when_recycle_fails(self):
+        zmod = self.src / "zipmod.scs"
+        make_zip(zmod, {"manifest.sii": MANIFEST_SII})
+        self.mod_dir.mkdir(parents=True)
+        (self.mod_dir / "zipmod.scs").write_bytes(b"OLD")
+        plan = self.plan(zmod)
+        with mock.patch.object(app, "send_to_recycle_bin", return_value=False):
+            done, errors = app.import_mods(plan["items"])
+        self.assertEqual(done, 0)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual((self.mod_dir / "zipmod.scs").read_bytes(), b"OLD")
+        self.assertEqual([p.name for p in self.mod_dir.iterdir()], ["zipmod.scs"])   # без «.part»
+
+
+class WorkshopHelpersTests(unittest.TestCase):
+    def test_package_id_roundtrip(self):
+        pkg = app.workshop_package_name("2661499223")
+        self.assertEqual(app.workshop_id_from_package(pkg), "2661499223")
+        self.assertIsNone(app.workshop_id_from_package("my_local_mod"))
+        self.assertIsNone(app.workshop_id_from_package(""))
+
+    def test_strip_bbcode(self):
+        text = "[h1]Title[/h1]\n[b]Bold[/b] [url=https://x.y]link[/url]\n[list][*]one[/list][img]https://i/p.png[/img]\n\n\n\nend"
+        self.assertEqual(app.strip_bbcode(text), "Title\nBold link (https://x.y)\n• one\n\nend")
+
+    def test_clean_mod_description(self):
+        self.assertEqual(app.clean_mod_description("[orange]Truck[/orange] [#FF00AA]v2[normal]\r\n\r\n\r\n[v1.5] ok"),
+                         "Truck v2\n\n[v1.5] ok")
+
+    def test_download_small_rejects_http(self):
+        self.assertIsNone(app.download_small("http://example.com/a.png"))
+
+
 class ScanInstalledModsTests(unittest.TestCase):
     def test_local_and_workshop(self):
         with tempfile.TemporaryDirectory() as t:

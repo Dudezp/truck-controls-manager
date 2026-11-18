@@ -340,6 +340,69 @@ def send_to_recycle_bin(paths: list) -> bool:
         return False
     return rc == 0 and not op.fAnyOperationsAborted
 
+def enable_file_drop(root, callback) -> bool:
+    """Перетягування файлів з Провідника у вікно Tk (у Tk немає власного drag & drop).
+    Вікно отримує WM_DROPFILES через підмінену віконну процедуру; callback(список шляхів) викликається
+    в головному потоці. False — не вдалося (тоді лишається кнопка «Додати мод»)."""
+    try:
+        user32, shell32 = ctypes.windll.user32, ctypes.windll.shell32
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        user32.CallWindowProcW.restype = LRESULT
+        user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        shell32.DragQueryFileW.restype = wintypes.UINT
+        shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_wchar_p, wintypes.UINT]
+        shell32.DragFinish.argtypes = [ctypes.c_void_p]
+        shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+        WM_DROPFILES, GWLP_WNDPROC = 0x0233, -4
+        hwnd = int(root.wm_frame(), 16)
+        old = user32.GetWindowLongPtrW(hwnd, GWLP_WNDPROC)
+        pending = []
+
+        # Віконна процедура викликається всередині циклу подій Tcl: звертатися звідси до Tkinter не можна
+        # (падіння інтерпретатора) — шляхи лише складаються в список, а забирає їх таймер Tk нижче
+        def proc(h, msg, wp, lp):
+            if msg == WM_DROPFILES:
+                try:
+                    files = []
+                    for i in range(shell32.DragQueryFileW(wp, 0xFFFFFFFF, None, 0)):
+                        n = shell32.DragQueryFileW(wp, i, None, 0)
+                        buf = ctypes.create_unicode_buffer(n + 1)
+                        shell32.DragQueryFileW(wp, i, buf, n + 1)
+                        files.append(buf.value)
+                    shell32.DragFinish(wp)
+                    pending.append(files)
+                except Exception:
+                    pass
+                return 0
+            return user32.CallWindowProcW(old, h, msg, wp, lp)
+
+        def poll():
+            while pending:
+                try:
+                    callback(pending.pop(0))
+                except Exception:
+                    pass
+            root.after(200, poll)
+
+        root._drop_proc = WNDPROC(proc)     # посилання тримаємо, інакше збирач сміття знищить callback
+        user32.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, ctypes.cast(root._drop_proc, ctypes.c_void_p))
+        # Якщо програма запущена від адміністратора, Windows без цього блокує drop з Провідника
+        try:
+            for m in (WM_DROPFILES, 0x004A, 0x0049):
+                user32.ChangeWindowMessageFilterEx(hwnd, m, 1, None)
+        except Exception:
+            pass
+        shell32.DragAcceptFiles(hwnd, True)
+        root.after(200, poll)
+        return True
+    except Exception:
+        return False
+
 def get_dir_size(path: Path) -> int:
     try:
         if path.is_file():
@@ -727,6 +790,14 @@ def _parse_mod_manifest(raw: bytes) -> dict:
         'mp_mod_optional': data.get('mp_mod_optional'),
     }
 
+_DESC_TAG = re.compile(
+    r'\[/?(?:orange|red|green|blue|yellow|white|black|gr[ae]y|cyan|magenta|purple|pink|brown|lime|gold|silver'
+    r'|b|i|u|normal|bold|italic|#[0-9a-f]{6,8})\]', re.I)
+
+def clean_mod_description(text: str) -> str:
+    """Опис мода без кольорових тегів SCS ([orange], [#ff0000] тощо)."""
+    return re.sub(r'\n{3,}', '\n\n', _DESC_TAG.sub('', text.replace('\r\n', '\n'))).strip()
+
 _MANIFEST_CACHE = {}
 
 def read_mod_manifests(path: Path) -> list:
@@ -784,12 +855,122 @@ def read_mod_info(path: Path) -> dict:
         if man['description_file']:
             raw = arc.read(man['description_file'])
             if raw:
-                info['description'] = _decode_mod_text(raw).strip()
+                info['description'] = clean_mod_description(_decode_mod_text(raw))
     except Exception:
         pass
     finally:
         arc.close()
     return info
+
+MOD_ARCHIVE_KINDS = ('folder', 'zip', 'hashfs1', 'hashfs2', 'encrypted', 'unknown')
+
+# Теки в корені ZIP, за якими видно, що це сам мод, а не архів із модами всередині
+_MOD_ROOT_DIRS = {'def', 'map', 'material', 'model', 'model2', 'vehicle', 'sound', 'ui', 'font', 'unit',
+                  'prefab', 'prefab2', 'automat', 'effect', 'system', 'locale', 'matlib', 'road_template'}
+
+def plan_mod_import(paths: list, mod_dir: Path) -> dict:
+    """Що з перетягнутих/вибраних файлів скопіювати в папку mod.
+    {'items': [{'src', 'member' (файл усередині ZIP-контейнера або None), 'dest', 'exists'}],
+     'skipped': [(шлях або ім'я, причина: 'unsupported' | 'not_mod' | 'already' | 'duplicate')]}.
+    .scs/.zip-мод і папка з manifest.sii копіюються як є; ZIP, у якому лежать лише .scs (так моди часто
+    викладають на сайтах), розпаковується — копіюються самі .scs."""
+    items, skipped, dests = [], [], set()
+    try:
+        mod_dir_res = mod_dir.resolve()
+    except OSError:
+        mod_dir_res = mod_dir
+
+    def add(src, dest_name, member=None):
+        dest = mod_dir / dest_name
+        if dest_name.lower() in dests:
+            skipped.append((member or str(src), 'duplicate'))
+            return
+        try:
+            if member is None and src.resolve().parent == mod_dir_res:
+                skipped.append((str(src), 'already'))
+                return
+        except OSError:
+            pass
+        dests.add(dest_name.lower())
+        items.append({'src': src, 'member': member, 'dest': dest, 'exists': dest.exists()})
+
+    def add_file(f: Path):
+        ext = f.suffix.lower()
+        if ext in ('.rar', '.7z'):
+            skipped.append((str(f), 'unsupported'))
+            return
+        if ext not in ('.scs', '.zip'):
+            skipped.append((str(f), 'not_mod'))
+            return
+        kind = mod_archive_kind(f)
+        if kind == 'zip':
+            try:
+                with zipfile.ZipFile(f) as zf:
+                    names = [n.replace('\\', '/') for n in zf.namelist()]
+            except Exception:
+                skipped.append((str(f), 'not_mod'))
+                return
+            tops = {n.split('/')[0].lower() for n in names if '/' in n}
+            roots = {n.lower() for n in names if '/' not in n}
+            if 'manifest.sii' in roots or tops & _MOD_ROOT_DIRS:
+                add(f, f.name)
+                return
+            inner = [n for n in names if n.lower().endswith(('.scs', '.zip')) and not n.endswith('/')]
+            if not inner:
+                skipped.append((str(f), 'not_mod'))
+                return
+            for n in inner:
+                add(f, n.rsplit('/', 1)[-1], member=n)
+            return
+        if kind in ('hashfs1', 'hashfs2', 'encrypted') and ext == '.scs':
+            add(f, f.name)
+            return
+        skipped.append((str(f), 'not_mod'))
+
+    for p in map(Path, paths):
+        if p.is_dir():
+            if (p / 'manifest.sii').is_file():
+                add(p, p.name)
+                continue
+            files = sorted(x for x in p.iterdir() if x.is_file() and x.suffix.lower() in ('.scs', '.zip'))
+            if not files:
+                skipped.append((str(p), 'not_mod'))
+            for x in files:
+                add_file(x)
+        elif p.is_file():
+            add_file(p)
+        else:
+            skipped.append((str(p), 'not_mod'))
+    return {'items': items, 'skipped': skipped}
+
+def import_mods(items: list) -> tuple:
+    """Копіює заплановане plan_mod_import. Наявний файл спершу йде в Кошик.
+    Копія пишеться у тимчасовий «.part» і лише потім перейменовується — обірване копіювання не лишає
+    битого мода. (скопійовано, [(ім'я, помилка)])."""
+    done, errors = 0, []
+    for it in items:
+        src, dest, member = Path(it['src']), Path(it['dest']), it['member']
+        tmp = dest.with_name(dest.name + '.part')
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if member is not None:
+                with zipfile.ZipFile(src) as zf, zf.open(member) as fin, open(tmp, 'wb') as fout:
+                    shutil.copyfileobj(fin, fout, 1024 * 1024)
+            elif src.is_dir():
+                shutil.copytree(src, tmp)
+            else:
+                shutil.copy2(src, tmp)
+            if dest.exists() and not (send_to_recycle_bin([dest]) and not dest.exists()):
+                raise OSError("could not move the old copy to the Recycle Bin")
+            os.replace(tmp, dest)
+            done += 1
+        except Exception as e:
+            errors.append((dest.name, str(e)))
+            try:
+                shutil.rmtree(tmp) if tmp.is_dir() else tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return done, errors
 
 def workshop_compatible(path: Path, game_version: str) -> bool | None:
     """Чи має мод Workshop версію для поточної гри (versions.sii). None — невідомо."""
@@ -854,7 +1035,7 @@ def get_workshop_tags(ids: list) -> dict:
     return {i: cache.get(i, []) for i in ids}
 
 def fetch_workshop_details(ids: list) -> dict:
-    """{id: {'title', 'tags'}} через публічний Steam Web API (без ключа)."""
+    """{id: {'title', 'tags', 'description', 'preview_url'}} через публічний Steam Web API (без ключа)."""
     details = {}
     for i in range(0, len(ids), 100):
         chunk = ids[i:i + 100]
@@ -871,13 +1052,40 @@ def fetch_workshop_details(ids: list) -> dict:
                 if item.get('result') == 1:
                     details[str(item['publishedfileid'])] = {
                         'title': item.get('title') or "",
-                        'tags': [t.get('tag', "") for t in item.get('tags', []) if t.get('tag')]}
+                        'tags': [t.get('tag', "") for t in item.get('tags', []) if t.get('tag')],
+                        'description': item.get('description') or "",
+                        'preview_url': item.get('preview_url') or ""}
         except Exception:
             break
     return details
 
 def workshop_package_name(ws_id: str) -> str:
     return f"mod_workshop_package.{int(ws_id):016X}"
+
+def workshop_id_from_package(pkg: str) -> str | None:
+    """ID предмета Workshop з імені пакета в profile.sii (mod_workshop_package.<16 hex>)."""
+    m = re.fullmatch(r'mod_workshop_package\.([0-9A-Fa-f]{16})', pkg or "")
+    return str(int(m.group(1), 16)) if m else None
+
+def strip_bbcode(text: str) -> str:
+    """Опис Workshop без розмітки BBCode ([b], [url=...], [img]...[/img])."""
+    text = re.sub(r'\[img\].*?\[/img\]', '', text or "", flags=re.I | re.S)
+    text = re.sub(r'\[url=([^\]]+)\](.*?)\[/url\]', r'\2 (\1)', text, flags=re.I | re.S)
+    text = re.sub(r'\[\*\]', '• ', text)
+    text = re.sub(r'\[/?[a-z0-9]+(?:=[^\]]*)?\]', '', text, flags=re.I)
+    return re.sub(r'\n{3,}', '\n\n', text).strip()
+
+def download_small(url: str, limit: int = 2 * 1024 * 1024) -> bytes | None:
+    """Невеликий файл (превʼю Workshop) або None. Лише https."""
+    if not url.startswith('https://'):
+        return None
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': f'TruckControlsManager/{APP_VERSION}'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = resp.read(limit + 1)
+        return data if len(data) <= limit else None
+    except Exception:
+        return None
 
 def scan_installed_mods(game_name: str, game_path: Path) -> dict:
     """{пакет: {'pkg','name','source','path','size','ws_id'}} для папки mod та Workshop."""
@@ -2495,6 +2703,63 @@ LANGUAGES = {
         "mods_no_unused": "✅ Усі встановлені моди використовуються хоча б одним профілем.",
         "mods_unused_head": "💤 Не увімкнені в жодному профілі цієї гри: {} ({})",
         "mods_unused_hint": "Підписки Workshop можна скасувати кнопкою «Підписки Workshop» — Steam видалить файли сам. Перевірено всі профілі гри.",
+        "mods_view_all": "Усі встановлені",
+        "mods_all_head": "Усі встановлені моди: {}  (# — позиція в профілі, якщо мод увімкнено)",
+        "mods_col_pos": "#",
+        "mods_col_name": "Назва",
+        "mods_col_source": "Джерело",
+        "mods_col_size": "Розмір",
+        "mods_col_status": "Стан",
+        "mods_src_workshop": "Steam",
+        "mods_src_local": "Сторонній",
+        "mods_status_on": "✓ увімкнено",
+        "mods_status_unused": "не використовується",
+        "mods_status_other_profile": "в іншому профілі",
+        "mods_info_empty": "Виберіть мод у списку — тут з'явиться інформація про нього.\n\nНові моди можна додати кнопкою «➕ Додати мод» або просто перетягнути файли .scs / .zip у це вікно.",
+        "mods_info_loading": "⏳ Читання мода...",
+        "mods_info_src_workshop": "🟦 Steam Workshop · ID {}",
+        "mods_info_src_local": "📁 Сторонній мод (папка mod)",
+        "mods_info_missing": "❌ Мод увімкнений у профілі, але його немає на диску.\nПакет: {}",
+        "mods_info_author": "Автор: {}",
+        "mods_info_version": "Версія: {}",
+        "mods_info_categories": "Категорії: {}",
+        "mods_info_format": "Формат: {}",
+        "mods_info_size": "Розмір: {}",
+        "mods_info_compat": "Сумісний з версіями гри: {}",
+        "mods_info_ws_compat_ok": "✅ Є версія для гри {}",
+        "mods_info_ws_compat_bad": "⚠ Немає версії для гри {}",
+        "mods_info_position": "У профілі: позиція {} з {}",
+        "mods_info_not_enabled": "У профілі: не увімкнено",
+        "mods_info_path": "Файл: {}",
+        "mods_info_encrypted": "🔒 Архів захищений автором — вміст не читається, але гра його завантажує.",
+        "mods_info_no_desc": "Опису немає.",
+        "mods_info_desc_head": "Опис",
+        "mods_info_desc_steam": "(опис зі сторінки Steam Workshop)",
+        "mods_fmt_folder": "папка (розпакований мод)",
+        "mods_fmt_zip": "ZIP",
+        "mods_fmt_hashfs1": "SCS (HashFS v1)",
+        "mods_fmt_hashfs2": "SCS (HashFS v2)",
+        "mods_fmt_encrypted": "захищений архів",
+        "mods_fmt_unknown": "невідомий",
+        "btn_mod_reveal": "📂 Показати файл",
+        "btn_mod_steam": "🌐 Сторінка в Steam",
+        "btn_mods_add": "➕ Додати мод",
+        "modadd_tip": "Скопіювати моди (.scs, .zip або папку з manifest.sii) у папку mod. Файли можна також просто перетягнути у вікно програми.",
+        "modadd_title": "Додати моди",
+        "modadd_filetypes": "Моди ETS2/ATS",
+        "modadd_confirm": "Скопіювати в папку mod гри {}?\n{}\n\n{}\n\nПісля копіювання увімкніть мод у менеджері модів гри.",
+        "modadd_replace": "замінить наявний, старий — у Кошик",
+        "modadd_skipped_head": "Пропущено:",
+        "modadd_skip_unsupported": ".rar/.7z не підтримуються — розпакуйте архів і додайте .scs",
+        "modadd_skip_not_mod": "не схоже на мод ETS2/ATS",
+        "modadd_skip_already": "уже в папці mod",
+        "modadd_skip_duplicate": "файл з таким іменем уже є у списку",
+        "modadd_none": "Немає модів для додавання.",
+        "modadd_busy": "Попереднє копіювання модів ще триває.",
+        "modadd_copying": "⏳ Копіювання модів...",
+        "modadd_done": "✅ Додано модів: {}",
+        "modadd_done_msg": "Додано модів: {}.\n\nУвімкніть їх у менеджері модів гри.",
+        "modadd_failed": "Скопійовано: {}. Не вдалося:\n{}",
         "settings_title": "Налаштування шляхів до ігор",
         "server_card_title": "Сервер конвою (server_config.sii)",
         "server_btn": "⚙ Налаштувати сервер",
@@ -3114,6 +3379,63 @@ LANGUAGES = {
         "mods_no_unused": "✅ Every installed mod is used by at least one profile.",
         "mods_unused_head": "💤 Not enabled in any profile of this game: {} ({})",
         "mods_unused_hint": "Unsubscribe via «Workshop Subscriptions» — Steam removes the files itself. All profiles of the game were checked.",
+        "mods_view_all": "All installed",
+        "mods_all_head": "All installed mods: {}  (# — position in the profile if the mod is enabled)",
+        "mods_col_pos": "#",
+        "mods_col_name": "Name",
+        "mods_col_source": "Source",
+        "mods_col_size": "Size",
+        "mods_col_status": "Status",
+        "mods_src_workshop": "Steam",
+        "mods_src_local": "Third-party",
+        "mods_status_on": "✓ enabled",
+        "mods_status_unused": "unused",
+        "mods_status_other_profile": "in another profile",
+        "mods_info_empty": "Select a mod in the list to see its details here.\n\nAdd new mods with «➕ Add mod» or just drag .scs / .zip files into this window.",
+        "mods_info_loading": "⏳ Reading the mod...",
+        "mods_info_src_workshop": "🟦 Steam Workshop · ID {}",
+        "mods_info_src_local": "📁 Third-party mod (mod folder)",
+        "mods_info_missing": "❌ Enabled in the profile but missing on disk.\nPackage: {}",
+        "mods_info_author": "Author: {}",
+        "mods_info_version": "Version: {}",
+        "mods_info_categories": "Categories: {}",
+        "mods_info_format": "Format: {}",
+        "mods_info_size": "Size: {}",
+        "mods_info_compat": "Compatible game versions: {}",
+        "mods_info_ws_compat_ok": "✅ Has a version for game {}",
+        "mods_info_ws_compat_bad": "⚠ No version for game {}",
+        "mods_info_position": "In profile: position {} of {}",
+        "mods_info_not_enabled": "In profile: not enabled",
+        "mods_info_path": "File: {}",
+        "mods_info_encrypted": "🔒 The author protected this archive — its contents can't be read, but the game loads it.",
+        "mods_info_no_desc": "No description.",
+        "mods_info_desc_head": "Description",
+        "mods_info_desc_steam": "(description from the Steam Workshop page)",
+        "mods_fmt_folder": "folder (unpacked mod)",
+        "mods_fmt_zip": "ZIP",
+        "mods_fmt_hashfs1": "SCS (HashFS v1)",
+        "mods_fmt_hashfs2": "SCS (HashFS v2)",
+        "mods_fmt_encrypted": "protected archive",
+        "mods_fmt_unknown": "unknown",
+        "btn_mod_reveal": "📂 Show file",
+        "btn_mod_steam": "🌐 Steam page",
+        "btn_mods_add": "➕ Add mod",
+        "modadd_tip": "Copy mods (.scs, .zip or a folder with manifest.sii) into the mod folder. You can also drag files into the app window.",
+        "modadd_title": "Add mods",
+        "modadd_filetypes": "ETS2/ATS mods",
+        "modadd_confirm": "Copy into the mod folder of {}?\n{}\n\n{}\n\nAfter copying, enable the mod in the in-game Mod Manager.",
+        "modadd_replace": "replaces the existing one, old copy goes to the Recycle Bin",
+        "modadd_skipped_head": "Skipped:",
+        "modadd_skip_unsupported": ".rar/.7z are not supported — extract the archive and add the .scs",
+        "modadd_skip_not_mod": "does not look like an ETS2/ATS mod",
+        "modadd_skip_already": "already in the mod folder",
+        "modadd_skip_duplicate": "a file with this name is already in the list",
+        "modadd_none": "Nothing to add.",
+        "modadd_busy": "The previous mod copy is still running.",
+        "modadd_copying": "⏳ Copying mods...",
+        "modadd_done": "✅ Mods added: {}",
+        "modadd_done_msg": "Mods added: {}.\n\nEnable them in the in-game Mod Manager.",
+        "modadd_failed": "Copied: {}. Failed:\n{}",
         "settings_title": "Game Directory Paths",
         "server_card_title": "Convoy Server (server_config.sii)",
         "server_btn": "⚙ Configure Server",
@@ -4315,6 +4637,8 @@ class TruckControlsApp(ctk.CTk):
         # Перевірка знижок Steam
         self.after(500, self.fetch_steam_sales)
         self.after(1000, self._flush_tk_garbage_loop)
+        # Перетягування модів (.scs/.zip) з Провідника у вікно — після того, як вікно з'явилося
+        self.after(300, lambda: enable_file_drop(self, self.on_files_dropped))
         # Перевірка нової версії на GitHub (тихо, у фоні)
         if self.settings.get("check_updates", True):
             self.after(3000, self.start_update_check)
@@ -5672,6 +5996,14 @@ class TruckControlsApp(ctk.CTk):
         )
         self.btn_mods_refresh.pack(side="left", padx=4)
 
+        self.btn_mods_add = ctk.CTkButton(
+            btn_box, text=self.t('btn_mods_add'), height=32,
+            fg_color=COLOR_SUCCESS, hover_color=COLOR_SUCCESS_HOVER,
+            command=self.mods_add_dialog
+        )
+        self.btn_mods_add.pack(side="left", padx=4)
+        Tooltip(self.btn_mods_add, self.t('modadd_tip'))
+
         self.btn_open_mods = ctk.CTkButton(
             btn_box, text=self.t('btn_open_mods'), height=32,
             fg_color="#374151", hover_color="#4B5563",
@@ -5710,7 +6042,8 @@ class TruckControlsApp(ctk.CTk):
 
         self.seg_mods_view = ctk.CTkSegmentedButton(
             filter_row,
-            values=[self.t('mods_view_order'), self.t('mods_view_problems'), self.t('mods_view_unused')],
+            values=[self.t('mods_view_order'), self.t('mods_view_all'), self.t('mods_view_problems'),
+                    self.t('mods_view_unused')],
             command=lambda _v: self.render_mods_view(),
             selected_color=UA_BLUE,
             selected_hover_color=UA_BLUE_HOVER,
@@ -5755,20 +6088,93 @@ class TruckControlsApp(ctk.CTk):
         Tooltip(self.btn_mods_disable_bad, self.t('moddis_tip'))
         self.btn_mods_disable_bad.grid_remove()
 
-        self.txt_mods = ctk.CTkTextbox(
-            tab,
-            corner_radius=10,
-            fg_color="#18191D",
-            font=ctk.CTkFont(family="Consolas", size=12),
-            text_color="#D1D5DB",
-            wrap="none"
-        )
-        self.txt_mods.grid(row=2, column=0, padx=12, pady=(4, 12), sticky="nsew")
-        self.txt_mods.tag_config("head", foreground=UA_YELLOW)
-        self.txt_mods.tag_config("err", foreground="#F87171")
-        self.txt_mods.tag_config("warn", foreground="#FBBF24")
-        self.txt_mods.tag_config("ok", foreground="#D1D5DB")
-        self.txt_mods.tag_config("muted", foreground=COLOR_TEXT_MUTED)
+        # Таблиця модів (ttk.Treeview, як у вкладці радіо) + панель інформації про вибраний мод
+        from tkinter import ttk
+        scale = self._get_window_scaling()
+        style = ttk.Style(self)
+        style.theme_use("default")
+        style.configure("Mods.Treeview", background="#18191D", fieldbackground="#18191D",
+                        foreground="#D1D5DB", rowheight=int(26 * scale), borderwidth=0,
+                        font=("Segoe UI", int(10 * scale)))
+        style.configure("Mods.Treeview.Heading", background="#25272D", foreground=UA_YELLOW,
+                        relief="flat", font=("Segoe UI", int(10 * scale), "bold"))
+        style.map("Mods.Treeview", background=[("selected", UA_BLUE)], foreground=[("selected", "#FFFFFF")])
+        style.map("Mods.Treeview.Heading", background=[("active", "#2D3039")])
+
+        body = ctk.CTkFrame(tab, fg_color="transparent")
+        body.grid(row=2, column=0, padx=12, pady=(4, 12), sticky="nsew")
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(1, weight=1)
+
+        self.lbl_mods_view_head = ctk.CTkLabel(
+            body, text="", font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color=COLOR_TEXT_MUTED, justify="left", anchor="w")
+        self.lbl_mods_view_head.grid(row=0, column=0, padx=4, pady=(0, 4), sticky="ew")
+        self.lbl_mods_view_head.bind(
+            "<Configure>", lambda e: self.lbl_mods_view_head.configure(wraplength=max(200, e.width - 8)))
+
+        table = ctk.CTkFrame(body, corner_radius=10, fg_color="#18191D")
+        table.grid(row=1, column=0, sticky="nsew")
+        table.grid_columnconfigure(0, weight=1)
+        table.grid_rowconfigure(0, weight=1)
+
+        cols = ("pos", "name", "source", "size", "status")
+        self.mods_tree = ttk.Treeview(table, columns=cols, show="headings", style="Mods.Treeview", selectmode="browse")
+        widths = {"pos": 44, "name": 330, "source": 90, "size": 80, "status": 170}
+        for c in cols:
+            self.mods_tree.heading(c, text=self.t(f'mods_col_{c}'), anchor="e" if c in ("pos", "size") else "w")
+            self.mods_tree.column(c, width=int(widths[c] * scale), stretch=c in ("name", "status"),
+                                  anchor="e" if c in ("pos", "size") else "w")
+        self.mods_tree.tag_configure("err", foreground="#F87171")
+        self.mods_tree.tag_configure("warn", foreground="#FBBF24")
+        self.mods_tree.tag_configure("on", foreground="#34D399")
+        self.mods_tree.tag_configure("muted", foreground=COLOR_TEXT_MUTED)
+        self.mods_tree.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=6)
+        sb = ctk.CTkScrollbar(table, command=self.mods_tree.yview)
+        sb.grid(row=0, column=1, sticky="ns", pady=6)
+        self.mods_tree.configure(yscrollcommand=sb.set)
+        self.mods_tree.bind("<<TreeviewSelect>>", lambda e: self._on_mod_selected())
+        self.mods_tree.bind("<Double-1>", lambda e: self.mod_reveal_selected())
+        self._mods_rows = {}
+
+        panel = ctk.CTkFrame(body, corner_radius=10, fg_color=COLOR_CARD_INNER, width=int(340 * scale))
+        panel.grid(row=0, column=1, rowspan=2, padx=(10, 0), sticky="nsew")
+        panel.grid_propagate(False)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(4, weight=1)
+        self.mod_info_icon = ctk.CTkLabel(panel, text="", height=10)
+        self.mod_info_icon.grid(row=0, column=0, padx=12, pady=(12, 4))
+        self.mod_info_name = ctk.CTkLabel(
+            panel, text=self.t('mods_info_empty'), font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+            text_color=COLOR_TEXT_WHITE, justify="left", anchor="w", wraplength=int(310 * scale))
+        self.mod_info_name.grid(row=1, column=0, padx=12, pady=(4, 2), sticky="ew")
+        self.mod_info_source = ctk.CTkLabel(
+            panel, text="", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            text_color=UA_BLUE_LIGHT, justify="left", anchor="w", wraplength=int(310 * scale))
+        self.mod_info_source.grid(row=2, column=0, padx=12, pady=2, sticky="ew")
+        # Деталі й опис — в одному полі з прокруткою, щоб на невисокому екрані нічого не обрізалось
+        self.mod_info_desc = ctk.CTkTextbox(
+            panel, corner_radius=8, fg_color="#18191D", font=ctk.CTkFont(family="Segoe UI", size=11),
+            text_color="#D1D5DB", wrap="word")
+        self.mod_info_desc.grid(row=4, column=0, padx=12, pady=(4, 12), sticky="nsew")
+        self.mod_info_desc.tag_config("head", foreground=UA_YELLOW)
+        self.mod_info_desc.tag_config("muted", foreground=COLOR_TEXT_MUTED)
+        self.mod_info_desc.configure(state="disabled")
+        self.mod_info_desc.grid_remove()
+        btns = ctk.CTkFrame(panel, fg_color="transparent")
+        btns.grid(row=3, column=0, padx=8, pady=(2, 2), sticky="ew")
+        self.btn_mod_reveal = ctk.CTkButton(
+            btns, text=self.t('btn_mod_reveal'), height=30, fg_color="#374151", hover_color="#4B5563",
+            command=self.mod_reveal_selected)
+        self.btn_mod_steam = ctk.CTkButton(
+            btns, text=self.t('btn_mod_steam'), height=30, fg_color=UA_BLUE, hover_color=UA_BLUE_HOVER,
+            command=self.mod_open_steam_page)
+        self._mod_info_token = 0
+        self._mod_info_cache = {}
+        self._mod_info_img = None
+        blank = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+        self._mod_info_blank = ctk.CTkImage(light_image=blank, dark_image=blank, size=(1, 1))
+        self.mod_info_icon.configure(image=self._mod_info_blank)
 
     # --- ВКЛАДКА РАДІО ---
     def _build_tab_radio(self):
@@ -8124,11 +8530,15 @@ class TruckControlsApp(ctk.CTk):
         messagebox.showinfo("OK", self.t('moddis_done_msg').format(len(remove)))
 
     def render_mods_view(self):
-        box = self.txt_mods
-        box.delete("1.0", "end")
+        tree = self.mods_tree
+        prev = tree.selection()
+        prev_key = self._mods_rows.get(prev[0]) if prev else None
+        tree.delete(*tree.get_children())
+        self._mods_rows = {}
+        head = self.lbl_mods_view_head
         mods = getattr(self, 'installed_mods', None)
         if mods is None:
-            box.insert("end", self.t('mods_scanning'), "muted")
+            head.configure(text=self.t('mods_scanning'), text_color=COLOR_TEXT_MUTED)
             return
 
         kw = self.entry_mods_filter.get().strip().lower()
@@ -8140,6 +8550,8 @@ class TruckControlsApp(ctk.CTk):
         missing = [(pkg, name) for pkg, name in active if pkg not in mods]
         outdated = [(pkg, name) for pkg, name in active if mods.get(pkg, {}).get('compatible') is False]
         unused = sorted((m for pkg, m in mods.items() if pkg not in used_anywhere), key=lambda m: -m['size'])
+        # Позиція в менеджері модів гри: згори — найвищий пріоритет (у profile.sii навпаки)
+        position = {pkg: i for i, (pkg, _n) in enumerate(reversed(active), 1)}
 
         total = sum(m['size'] for m in mods.values())
         n_ws = sum(1 for m in mods.values() if m['source'] == 'workshop')
@@ -8153,70 +8565,304 @@ class TruckControlsApp(ctk.CTk):
         else:
             self.btn_mods_disable_bad.grid_remove()
 
-        def match(*parts):
-            return not kw or any(kw in (p or "").lower() for p in parts)
+        def source(pkg, m):
+            if m:
+                return self.t('mods_src_workshop') if m['source'] == 'workshop' else self.t('mods_src_local')
+            return self.t('mods_src_workshop') if workshop_id_from_package(pkg) else "?"
 
-        def src_tag(m):
-            if not m:
-                return ""
-            return "Workshop" if m['source'] == 'workshop' else "mod"
+        def add_row(pkg, name, pos=""):
+            m = mods.get(pkg)
+            label = self._mod_label(pkg, name)
+            if kw and not any(kw in (p or "").lower() for p in (label, pkg, m and m.get('ws_id'))):
+                return
+            if m is None:
+                status, tag = f"❌ {self.t('mods_note_missing')}", "err"
+            elif m.get('compatible') is False:
+                status, tag = f"⚠ {self.t('mods_note_outdated').format(self.game_version)}", "warn"
+            elif pkg in position:
+                status, tag = self.t('mods_status_on'), "on"
+            elif pkg not in used_anywhere:
+                status, tag = self.t('mods_status_unused'), "muted"
+            else:
+                status, tag = self.t('mods_status_other_profile'), ""
+            iid = tree.insert("", "end", values=(pos, label, source(pkg, m), fmt_size(m['size']) if m else "", status),
+                              tags=(tag,) if tag else ())
+            self._mods_rows[iid] = (pkg, name)
 
+        text, color = "", COLOR_TEXT_MUTED
         if view == 0:
             if not has_profile:
-                box.insert("end", self.t('tweak_no_profile'), "muted")
-                return
-            box.insert("end", self.t('mods_order_head').format(len(active)) + "\n\n", "muted")
-            # У profile.sii active_mods[0] — найнижчий пріоритет, а гра показує найвищий згори
-            for i, (pkg, name) in enumerate(reversed(active), 1):
-                m = mods.get(pkg)
-                label = self._mod_label(pkg, name)
-                if not match(label, pkg):
-                    continue
-                if m is None:
-                    mark, tag, note = "❌", "err", self.t('mods_note_missing')
-                elif m.get('compatible') is False:
-                    mark, tag, note = "⚠", "warn", self.t('mods_note_outdated').format(self.game_version)
-                else:
-                    mark, tag, note = "  ", "ok", ""
-                info = f"{src_tag(m):<8} {fmt_size(m['size']):>9}" if m else ""
-                box.insert("end", f"{mark} {i:>3}. {label[:60]:<60} {info}", tag)
-                box.insert("end", f"  {note}\n" if note else "\n", "muted" if not note else tag)
-            return
-
-        if view == 1:
+                text = self.t('tweak_no_profile')
+            else:
+                text = self.t('mods_order_head').format(len(active))
+                for i, (pkg, name) in enumerate(reversed(active), 1):
+                    add_row(pkg, name, i)
+        elif view == 1:
+            text = self.t('mods_all_head').format(len(mods))
+            for m in sorted(mods.values(), key=lambda m: self._mod_label(m['pkg']).lower()):
+                add_row(m['pkg'], "", position.get(m['pkg'], ""))
+        elif view == 2:
             if not missing and not outdated:
-                box.insert("end", self.t('mods_no_problems'), "muted")
+                text = self.t('mods_no_problems')
+            else:
+                parts = []
+                if missing:
+                    parts.append(self.t('mods_missing_head').format(len(missing)) + " — " + self.t('mods_missing_hint'))
+                if outdated:
+                    parts.append(self.t('mods_outdated_head').format(len(outdated), self.game_version) + " — "
+                                 + self.t('mods_outdated_hint'))
+                text, color = "\n".join(parts), "#FBBF24"
+                for pkg, name in missing + outdated:
+                    add_row(pkg, name, position.get(pkg, ""))
+        else:
+            if not unused:
+                text = self.t('mods_no_unused')
+            else:
+                text = (self.t('mods_unused_head').format(len(unused), fmt_size(sum(m['size'] for m in unused)))
+                        + "\n" + self.t('mods_unused_hint'))
+                for m in unused:
+                    add_row(m['pkg'], "")
+        head.configure(text=text, text_color=color)
+
+        # Вибір зберігається між перемальовуваннями (пошук, пересканування)
+        for iid, key in self._mods_rows.items():
+            if prev_key and key[0] == prev_key[0]:
+                tree.selection_set(iid)
+                tree.see(iid)
+                break
+        else:
+            self._show_mod_info(None)
+
+    # --- ПАНЕЛЬ ІНФОРМАЦІЇ ПРО МОД ---
+    def _selected_mod(self):
+        sel = self.mods_tree.selection()
+        return self._mods_rows.get(sel[0]) if sel else None
+
+    def _on_mod_selected(self):
+        key = self._selected_mod()
+        self._show_mod_info(key)
+
+    def _show_mod_info(self, key):
+        """Заповнює панель праворуч. Читання архіву і запит до Steam — у фоновому потоці."""
+        self._mod_info_token += 1
+        token = self._mod_info_token
+        self.btn_mod_reveal.pack_forget()
+        self.btn_mod_steam.pack_forget()
+        # image=None у CTkLabel ламається, якщо стару картинку вже знищено, — тому порожня картинка 1×1
+        self.mod_info_icon.configure(image=self._mod_info_blank, text="")
+        self._mod_info_img = None
+        if key is None:
+            self.mod_info_name.configure(text=self.t('mods_info_empty'), text_color=COLOR_TEXT_MUTED,
+                                         font=ctk.CTkFont(family="Segoe UI", size=12))
+            self.mod_info_source.configure(text="")
+            self._set_mod_info_text(None)
+            return
+        pkg, name = key
+        m = getattr(self, 'installed_mods', {}).get(pkg)
+        ws_id = (m and m.get('ws_id')) or workshop_id_from_package(pkg)
+        self.mod_info_name.configure(text=self._mod_label(pkg, name), text_color=COLOR_TEXT_WHITE,
+                                     font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"))
+        if ws_id:
+            self.mod_info_source.configure(text=self.t('mods_info_src_workshop').format(ws_id), text_color=UA_BLUE_LIGHT)
+            self.btn_mod_steam.pack(side="right", padx=4)
+        else:
+            self.mod_info_source.configure(text=self.t('mods_info_src_local'), text_color=UA_YELLOW)
+        if m is None:
+            self._set_mod_info_text(self.t('mods_info_missing').format(pkg))
+            if not ws_id:
                 return
-            if missing:
-                box.insert("end", self.t('mods_missing_head').format(len(missing)) + "\n", "head")
-                box.insert("end", self.t('mods_missing_hint') + "\n\n", "muted")
-                for pkg, name in missing:
-                    if match(name, pkg):
-                        box.insert("end", f"  ❌ {name}\n", "err")
-                        box.insert("end", f"       {pkg}\n", "muted")
-                box.insert("end", "\n")
-            if outdated:
-                box.insert("end", self.t('mods_outdated_head').format(len(outdated), self.game_version) + "\n", "head")
-                box.insert("end", self.t('mods_outdated_hint') + "\n\n", "muted")
-                for pkg, name in outdated:
-                    label = self._mod_label(pkg, name)
-                    if match(label, pkg):
-                        box.insert("end", f"  ⚠ {label}\n", "warn")
+        else:
+            self.btn_mod_reveal.pack(side="left", padx=4)
+            self._set_mod_info_text(self.t('mods_info_loading'))
+
+        path = m['path'] if m else None
+        cache_key = (str(path), ws_id)
+        if cache_key in self._mod_info_cache:
+            self._fill_mod_info(key, self._mod_info_cache[cache_key])
             return
 
-        # view == 2: невикористані
-        if not unused:
-            box.insert("end", self.t('mods_no_unused'), "muted")
+        result = {}
+
+        def work():
+            try:
+                info = read_mod_info(path) if path else {}
+                if ws_id and (not info.get('description') or not info.get('icon') or not info.get('display_name')):
+                    d = fetch_workshop_details([ws_id]).get(ws_id) or {}
+                    info['steam_title'] = d.get('title')
+                    info['steam_description'] = strip_bbcode(d.get('description', ""))
+                    if not info.get('icon') and d.get('preview_url'):
+                        info['icon'] = download_small(d['preview_url'])
+            except Exception:
+                info = {}
+            result['info'] = info
+
+        def poll():
+            if token != self._mod_info_token:
+                return
+            if 'info' not in result:
+                self.after(100, poll)
+                return
+            self._mod_info_cache[cache_key] = result['info']
+            self._fill_mod_info(key, result['info'])
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(100, poll)
+
+    def _fill_mod_info(self, key, info: dict):
+        pkg, name = key
+        m = getattr(self, 'installed_mods', {}).get(pkg)
+        if info.get('icon'):
+            try:
+                from io import BytesIO
+                img = Image.open(BytesIO(info['icon']))
+                img.load()
+                max_w = 300
+                ratio = min(max_w / img.width, 140 / img.height, 1.5)
+                size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
+                self._mod_info_img = ctk.CTkImage(light_image=img, dark_image=img, size=size)
+                self.mod_info_icon.configure(image=self._mod_info_img, text="")
+            except Exception:
+                pass
+        title = info.get('display_name') or info.get('steam_title')
+        if title:
+            self.mod_info_name.configure(text=title)
+        lines = []
+        if info.get('author'):
+            lines.append(self.t('mods_info_author').format(info['author']))
+        if info.get('package_version'):
+            lines.append(self.t('mods_info_version').format(info['package_version']))
+        if info.get('categories'):
+            lines.append(self.t('mods_info_categories').format(", ".join(info['categories'])))
+        if m is not None:
+            lines.append(self.t('mods_info_format').format(self.t('mods_fmt_' + info.get('kind', 'unknown'))))
+            lines.append(self.t('mods_info_size').format(fmt_size(m['size'])))
+            if m.get('compatible') is True:
+                lines.append(self.t('mods_info_ws_compat_ok').format(self.game_version))
+            elif m.get('compatible') is False:
+                lines.append(self.t('mods_info_ws_compat_bad').format(self.game_version))
+            elif info.get('compatible_versions'):
+                lines.append(self.t('mods_info_compat').format(", ".join(info['compatible_versions'])))
+            active = self._profile_active_mods() if self.get_selected_profile_path() else []
+            pkgs = [p for p, _n in reversed(active)]
+            if pkg in pkgs:
+                lines.append(self.t('mods_info_position').format(pkgs.index(pkg) + 1, len(pkgs)))
+            else:
+                lines.append(self.t('mods_info_not_enabled'))
+            lines.append(self.t('mods_info_path').format(m['path']))
+            if info.get('kind') == 'encrypted':
+                lines.append(self.t('mods_info_encrypted'))
+        else:
+            lines.insert(0, self.t('mods_info_missing').format(pkg))
+        desc, note = info.get('description'), None
+        if not desc and info.get('steam_description'):
+            desc, note = info['steam_description'], self.t('mods_info_desc_steam')
+        self._set_mod_info_text("\n".join(lines), desc or self.t('mods_info_no_desc'), note)
+
+    def _set_mod_info_text(self, details, desc=None, note=None):
+        box = self.mod_info_desc
+        if details is None:
+            box.grid_remove()
             return
-        box.insert("end", self.t('mods_unused_head').format(len(unused), fmt_size(sum(m['size'] for m in unused))) + "\n", "head")
-        box.insert("end", self.t('mods_unused_hint') + "\n\n", "muted")
-        for m in unused:
-            label = self._mod_label(m['pkg'])
-            if not match(label, m['pkg'], m.get('ws_id')):
-                continue
-            note = f"  ⚠ {self.t('mods_note_outdated').format(self.game_version)}" if m.get('compatible') is False else ""
-            box.insert("end", f"  {label[:60]:<60} {src_tag(m):<8} {fmt_size(m['size']):>9}", "ok")
-            box.insert("end", f"{note}\n", "warn")
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        box.insert("end", details + "\n")
+        if desc is not None:
+            box.insert("end", "\n" + self.t('mods_info_desc_head') + "\n", "head")
+            box.insert("end", desc + "\n")
+        if note:
+            box.insert("end", "\n" + note, "muted")
+        box.configure(state="disabled")
+        box.grid()
+
+    def mod_reveal_selected(self):
+        key = self._selected_mod()
+        m = getattr(self, 'installed_mods', {}).get(key[0]) if key else None
+        if not m or not m['path'].exists():
+            return
+        import subprocess
+        subprocess.Popen(['explorer', '/select,', str(m['path'])])
+
+    def mod_open_steam_page(self):
+        key = self._selected_mod()
+        if not key:
+            return
+        m = getattr(self, 'installed_mods', {}).get(key[0])
+        ws_id = (m and m.get('ws_id')) or workshop_id_from_package(key[0])
+        if ws_id:
+            import webbrowser
+            webbrowser.open(f"https://steamcommunity.com/sharedfiles/filedetails/?id={ws_id}")
+
+    # --- ДОДАВАННЯ МОДІВ (кнопка або перетягування файлів у вікно) ---
+    def mods_add_dialog(self):
+        files = filedialog.askopenfilenames(
+            title=self.t('modadd_title'),
+            filetypes=[(self.t('modadd_filetypes'), "*.scs *.zip"), ("*", "*.*")])
+        if files:
+            self.mods_add_paths(list(files))
+
+    def on_files_dropped(self, paths: list):
+        try:
+            self.tabview.set(self.t('tab_mods'))
+        except Exception:
+            pass
+        self.mods_add_paths(paths)
+
+    def mods_add_paths(self, paths: list):
+        if getattr(self, '_mods_import_thread', None) and self._mods_import_thread.is_alive():
+            messagebox.showinfo("!", self.t('modadd_busy'))
+            return
+        game_path = self.get_active_game_path()
+        if not game_path.exists():
+            messagebox.showwarning("!", self.t('msg_folder_missing').format(game_path))
+            return
+        mod_dir = game_path / 'mod'
+        plan = plan_mod_import(paths, mod_dir)
+        reasons = {'unsupported': 'modadd_skip_unsupported', 'not_mod': 'modadd_skip_not_mod',
+                   'already': 'modadd_skip_already', 'duplicate': 'modadd_skip_duplicate'}
+        skipped = "\n".join(f"• {Path(p).name} — {self.t(reasons[r])}" for p, r in plan['skipped'])
+        if not plan['items']:
+            messagebox.showwarning("!", self.t('modadd_none') + ("\n\n" + skipped if skipped else ""))
+            return
+        lines = []
+        for it in plan['items']:
+            line = f"• {it['dest'].name}"
+            if it['member']:
+                line += f"  ← {Path(it['src']).name}"
+            if it['exists']:
+                line += f"  ({self.t('modadd_replace')})"
+            lines.append(line)
+        msg = self.t('modadd_confirm').format(self.current_game, mod_dir, "\n".join(lines[:25]))
+        if len(lines) > 25:
+            msg += f"\n… +{len(lines) - 25}"
+        if skipped:
+            msg += "\n\n" + self.t('modadd_skipped_head') + "\n" + skipped
+        if not messagebox.askyesno(self.t('modadd_title'), msg):
+            return
+        self.set_status(self.t('modadd_copying'))
+        self.btn_mods_add.configure(state="disabled")
+        result = {}
+
+        def work():
+            result['r'] = import_mods(plan['items'])
+
+        def poll():
+            if 'r' not in result:
+                self.after(200, poll)
+                return
+            self.btn_mods_add.configure(state="normal")
+            done, errors = result['r']
+            self.logger.info(f"Mods imported into {mod_dir}: {done}, errors: {errors}")
+            self.refresh_mods_diag()
+            if errors:
+                messagebox.showerror(self.t('dlg_error'), self.t('modadd_failed').format(
+                    done, "\n".join(f"• {n}: {e}" for n, e in errors)))
+            else:
+                self.set_status(self.t('modadd_done').format(done))
+                messagebox.showinfo("OK", self.t('modadd_done_msg').format(done))
+
+        self._mods_import_thread = threading.Thread(target=work, daemon=True)
+        self._mods_import_thread.start()
+        self.after(200, poll)
 
     def clean_cache_current(self):
         if is_game_running(self.current_game):

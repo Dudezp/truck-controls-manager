@@ -80,6 +80,7 @@ class TranslationTests(unittest.TestCase):
         keys += ["modsort_tier_" + k for k, _ in app.MOD_SORT_TIERS]
         keys += ["km_" + k for k, _ in app.KNOWN_CRASH_MODULES] + ["km_injector"]
         keys += ["km_" + k + "_tip" for k, _ in app.KNOWN_CRASH_MODULES] + ["km_injector_tip"]
+        keys += ["mods_fmt_" + k for k in app.MOD_ARCHIVE_KINDS]
         for lang in ("uk", "en"):
             missing = [k for k in keys if k not in app.LANGUAGES[lang]]
             self.assertEqual(missing, [], lang)
