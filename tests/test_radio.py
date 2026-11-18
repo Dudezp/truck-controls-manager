@@ -45,6 +45,12 @@ class LiveStreamsFileTests(unittest.TestCase):
             p.write_text("SiiNunit\n{\n}\n")
             self.assertEqual(app.read_live_streams(p), ("_nameless.radio", []))
 
+    def test_zero_stations(self):
+        with tempfile.TemporaryDirectory() as t:
+            p = Path(t) / "live_streams.sii"
+            app.write_live_streams(p, "_nameless.r", [])
+            self.assertEqual(app.read_live_streams(p), ("_nameless.r", []))
+
 
 def catalogue(**kw):
     s = {"name": "Rock FM", "url": "http://r/x", "url_resolved": "http://r/stream.mp3", "codec": "MP3",

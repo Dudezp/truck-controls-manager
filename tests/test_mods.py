@@ -179,5 +179,50 @@ class ReorderProfileModsTests(unittest.TestCase):
             app.reorder_profile_mods(raw.replace(b" active_mods: 3\n", b""), [0, 1, 2])
 
 
+class RemoveProfileModsTests(unittest.TestCase):
+    def mods(self, raw: bytes):
+        return app.sii_array(app.parse_sii_unit(raw.decode()), "active_mods")
+
+    def test_remove_keeps_order_and_other_lines(self):
+        out = app.remove_profile_mods(PROFILE_SII.encode(), {1})
+        self.assertEqual(self.mods(out), ["mod_a|Mod A", "mod_c|Mod C"])
+        text = out.decode()
+        self.assertIn(" active_mods: 2\n active_mods[0]: \"mod_a|Mod A\"\n active_mods[1]: \"mod_c|Mod C\"\n", text)
+        self.assertEqual(text.count("\n"), PROFILE_SII.count("\n") - 1)
+        self.assertIn(' profile_name: "Test Driver"', text)
+
+    def test_remove_all(self):
+        out = app.remove_profile_mods(PROFILE_SII.encode(), [0, 1, 2])
+        self.assertEqual(self.mods(out), [])
+        self.assertIn(b" active_mods: 0\n profile_name", out)
+        # Result is still a valid layout: reordering/removing again must not fail on it
+        self.assertEqual(app.reorder_profile_mods(out, []), out)
+
+    def test_crlf_and_encrypted(self):
+        raw = encrypt_scsc(PROFILE_SII.replace("\n", "\r\n").encode())
+        out = app.remove_profile_mods(raw, {0, 2})
+        self.assertTrue(out.startswith(b"SiiNunit"))
+        self.assertNotIn(b"\n", out.replace(b"\r\n", b""))
+        self.assertEqual(self.mods(out), ["mod_b|Mod B"])
+
+    def test_errors(self):
+        raw = PROFILE_SII.encode()
+        for bad in (set(), {3}, {-1}):
+            with self.assertRaises(ValueError, msg=bad):
+                app.remove_profile_mods(raw, bad)
+        with self.assertRaises(ValueError):
+            app.remove_profile_mods(b"BSII\x03\0\0\0", {0})
+
+
+class SiiArrayTests(unittest.TestCase):
+    def test_empty_array_is_count_only(self):
+        data = app.parse_sii_unit("SiiNunit\n{\nuser_profile : x {\n active_mods: 0\n face: 1\n}\n}\n")
+        self.assertEqual(data["active_mods"], "0")          # raw parser keeps the counter
+        self.assertEqual(app.sii_array(data, "active_mods"), [])
+        self.assertEqual(app.sii_array(data, "nothing"), [])
+        self.assertEqual(app.sii_array(None, "active_mods"), [])
+        self.assertEqual(app.sii_array(app.parse_sii_unit(PROFILE_SII), "active_mods")[0], "mod_a|Mod A")
+
+
 if __name__ == "__main__":
     unittest.main()

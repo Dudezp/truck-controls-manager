@@ -215,6 +215,12 @@ def parse_sii_unit(text: str) -> dict:
     data.update(arrays)
     return data
 
+def sii_array(data: dict | None, key: str) -> list:
+    """Масив із результату parse_sii_unit. Порожній масив SII записано лише лічильником («key: 0») —
+    тоді parse_sii_unit повертає рядок '0', а не список."""
+    v = (data or {}).get(key)
+    return v if isinstance(v, list) else []
+
 def sii_float(val) -> float | None:
     """SII зберігає float або звичайним числом, або як &hex (IEEE 754 big-endian)."""
     try:
@@ -694,9 +700,9 @@ def plan_mod_sort(items: list) -> dict:
 _ACTIVE_MODS_COUNT = re.compile(r'^(\s*)active_mods\s*:\s*(\d+)\s*$')
 _ACTIVE_MODS_ITEM = re.compile(r'^(\s*)active_mods\[(\d*)\]\s*:\s*(.*?)\s*$')
 
-def reorder_profile_mods(raw: bytes, order: list) -> bytes:
-    """profile.sii з active_mods у порядку `order` (order[k] — який запис файлу стане active_mods[k]).
-    Пишеться відкритим текстом SII (гра читає його так само, як зашифрований); інші рядки не змінюються."""
+def _active_mods_layout(raw: bytes) -> tuple:
+    """(текст, рядки, індекс рядка «active_mods: N», N, збіги рядків active_mods[k]) із profile.sii.
+    Будь-яке відхилення від звичного розташування — ValueError, щоб нічого не зіпсувати."""
     if raw[:4] == SCSC_MAGIC:
         raw = _decrypt_scsc(raw) or b''
     if not raw.lstrip(b'\xef\xbb\xbf').startswith(b'SiiNunit'):
@@ -717,17 +723,46 @@ def reorder_profile_mods(raw: bytes, order: list) -> bytes:
     others = lines[:c] + lines[c + 1 + n:]
     if any(_ACTIVE_MODS_ITEM.match(l.rstrip('\r')) for l in others):
         raise ValueError("unexpected active_mods layout in profile.sii")
+    return text, lines, c, n, items
+
+def reorder_profile_mods(raw: bytes, order: list) -> bytes:
+    """profile.sii з active_mods у порядку `order` (order[k] — який запис файлу стане active_mods[k]).
+    Пишеться відкритим текстом SII (гра читає його так само, як зашифрований); інші рядки не змінюються."""
+    text, lines, c, n, items = _active_mods_layout(raw)
     if sorted(order) != list(range(n)):
         raise ValueError("bad mod order")
     for k, src in enumerate(order):
         cr = '\r' if lines[c + 1 + k].endswith('\r') else ''
         lines[c + 1 + k] = f"{items[k].group(1)}active_mods[{k}]: {items[src].group(3)}{cr}"
     out = '\n'.join(lines)
-    before = parse_sii_unit(text).get('active_mods') or []
-    after = parse_sii_unit(out).get('active_mods') or []
+    before = sii_array(parse_sii_unit(text), 'active_mods')
+    after = sii_array(parse_sii_unit(out), 'active_mods')
     old_lines, new_lines = text.split('\n'), out.split('\n')
     if (after != [before[i] for i in order] or len(new_lines) != len(old_lines)
             or new_lines[:c + 1] != old_lines[:c + 1] or new_lines[c + 1 + n:] != old_lines[c + 1 + n:]):
+        raise ValueError("verification failed")
+    return out.encode('utf-8')
+
+def remove_profile_mods(raw: bytes, remove) -> bytes:
+    """profile.sii без записів active_mods з індексами `remove` (індекси у файлі) — моди вимикаються,
+    порядок решти не змінюється. Інші рядки файлу лишаються як були."""
+    text, lines, c, n, items = _active_mods_layout(raw)
+    remove = set(remove)
+    if not remove or not remove <= set(range(n)):
+        raise ValueError("bad mod selection")
+    keep = [k for k in range(n) if k not in remove]
+    def crlf(line):
+        return '\r' if line.endswith('\r') else ''
+    indent = _ACTIVE_MODS_COUNT.match(lines[c].rstrip('\r')).group(1)
+    block = [f"{indent}active_mods: {len(keep)}{crlf(lines[c])}"]
+    block += [f"{items[src].group(1)}active_mods[{k}]: {items[src].group(3)}{crlf(lines[c + 1 + src])}"
+              for k, src in enumerate(keep)]
+    new_lines = lines[:c] + block + lines[c + 1 + n:]
+    out = '\n'.join(new_lines)
+    before = sii_array(parse_sii_unit(text), 'active_mods')
+    after = sii_array(parse_sii_unit(out), 'active_mods')
+    if (after != [before[i] for i in keep] or new_lines[:c] != lines[:c]
+            or new_lines[c + 1 + len(keep):] != lines[c + 1 + n:]):
         raise ValueError("verification failed")
     return out.encode('utf-8')
 
@@ -1040,7 +1075,7 @@ def read_live_streams(path: Path) -> tuple:
     text = path.read_text(encoding='utf-8', errors='ignore')
     m = re.search(r'live_stream_def\s*:\s*(\S+)\s*\{', text)
     data = parse_sii_unit(text)
-    return (m.group(1) if m else "_nameless.radio"), [parse_radio_entry(x) for x in data.get('stream_data', []) or []]
+    return (m.group(1) if m else "_nameless.radio"), [parse_radio_entry(x) for x in sii_array(data, 'stream_data')]
 
 def write_live_streams(path: Path, unit_name: str, stations: list):
     lines = ["SiiNunit", "{", f"live_stream_def : {unit_name} {{", f" stream_data: {len(stations)}"]
@@ -1759,8 +1794,19 @@ LANGUAGES = {
         "modsort_changed": "Список модів у profile.sii змінився — запустіть автосортування ще раз.",
         "modsort_done": "Порядок модів оновлено",
         "modsort_done_msg": "Порядок модів оновлено. Запустіть гру й перевірте менеджер модів. Якщо щось не так — кнопка «↶ Скасувати» у вкладці «Моди» поверне попередній порядок.",
-        "modsort_undo_confirm": "Повернути попередній порядок модів?\n\n{}",
-        "modsort_undone": "Попередній порядок модів повернуто",
+        "modsort_undo_confirm": "Повернути попередній список модів (порядок і увімкнені моди)?\n\n{}",
+        "modsort_undone": "Попередній список модів повернуто",
+        "btn_mods_disable_bad": "🧹 Вимкнути проблемні",
+        "btn_mods_disable_bad_n": "🧹 Вимкнути проблемні ({})",
+        "moddis_tip": "Вимкнути в профілі одним махом увімкнені моди, яких немає на диску, і моди без версії для поточної гри. Перед записом — список для перевірки й бекап profile.sii; «↶ Скасувати» поверне все назад.",
+        "moddis_title": "Вимкнення проблемних модів",
+        "moddis_head": "Позначені групи модів буде вимкнено в профілі (вони зникнуть зі списку активних у менеджері модів гри). Самі файли модів і підписки Workshop не видаляються — увімкнути мод знову можна в грі.",
+        "moddis_missing": "Відсутні на диску ({})",
+        "moddis_outdated": "Без версії для гри {1} ({0})",
+        "moddis_note": "Сейви, створені з цими модами, гра може відкрити з попередженням про відсутні моди. Бекап profile.sii створюється автоматично.",
+        "moddis_apply": "🧹 Вимкнути",
+        "moddis_done": "Вимкнено модів: {}",
+        "moddis_done_msg": "Вимкнено модів: {}. Запустіть гру й перевірте менеджер модів. Якщо щось не так — кнопка «↶ Скасувати» у вкладці «Моди» поверне попередній список.",
         "modsort_tier_ui": "Інтерфейс, навігація, мапа",
         "modsort_tier_graphics": "Графіка та погода",
         "modsort_tier_sound": "Звук",
@@ -2367,8 +2413,19 @@ LANGUAGES = {
         "modsort_changed": "The mod list in profile.sii has changed — run auto-sort again.",
         "modsort_done": "Mod order updated",
         "modsort_done_msg": "Mod order updated. Start the game and check the Mod Manager. If something is wrong, «↶ Undo» on the Mods tab restores the previous order.",
-        "modsort_undo_confirm": "Restore the previous mod order?\n\n{}",
-        "modsort_undone": "Previous mod order restored",
+        "modsort_undo_confirm": "Restore the previous mod list (order and enabled mods)?\n\n{}",
+        "modsort_undone": "Previous mod list restored",
+        "btn_mods_disable_bad": "🧹 Disable broken",
+        "btn_mods_disable_bad_n": "🧹 Disable broken ({})",
+        "moddis_tip": "Disable in the profile, in one go, the enabled mods that are missing on disk and the mods without a version for the current game. You review the list first, profile.sii is backed up, and «↶ Undo» restores everything.",
+        "moddis_title": "Disable broken mods",
+        "moddis_head": "The checked groups will be disabled in the profile (they leave the active list in the game's Mod Manager). Mod files and Workshop subscriptions are not deleted — you can enable a mod again in the game.",
+        "moddis_missing": "Missing on disk ({})",
+        "moddis_outdated": "No version for game {1} ({0})",
+        "moddis_note": "Saves made with these mods may open with a warning about missing mods. profile.sii is backed up automatically.",
+        "moddis_apply": "🧹 Disable",
+        "moddis_done": "Mods disabled: {}",
+        "moddis_done_msg": "Mods disabled: {}. Start the game and check the Mod Manager. If something is wrong, «↶ Undo» on the Mods tab restores the previous list.",
         "modsort_tier_ui": "UI, navigation, map screen",
         "modsort_tier_graphics": "Graphics & weather",
         "modsort_tier_sound": "Sound",
@@ -3509,6 +3566,82 @@ class ModSortDialog(ctk.CTkToplevel):
     def _ok(self):
         self.result = True
         self.destroy()
+
+
+class ModDisableDialog(ctk.CTkToplevel):
+    """Вибір проблемних модів для вимкнення; result — множина груп {'missing', 'outdated'} або None."""
+    def __init__(self, master, t, missing: list, outdated: list, game_version: str):
+        super().__init__(master)
+        self.t = t
+        self.result = None
+        self.title(t('moddis_title'))
+        self.geometry("760x560")
+        self.minsize(560, 380)
+        self.transient(master)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        ctk.CTkLabel(self, text=t('moddis_head'), justify="left", wraplength=720,
+                     font=ctk.CTkFont(family="Segoe UI", size=12)).grid(row=0, column=0, padx=16, pady=(14, 6), sticky="w")
+        checks = ctk.CTkFrame(self, fg_color="transparent")
+        checks.grid(row=1, column=0, padx=14, pady=2, sticky="w")
+        self.var_missing = tk.BooleanVar(value=bool(missing))
+        self.var_outdated = tk.BooleanVar(value=bool(outdated))
+        ctk.CTkCheckBox(checks, text=t('moddis_missing').format(len(missing)), variable=self.var_missing,
+                        state="normal" if missing else "disabled", command=self._sync).pack(side="left", padx=4)
+        ctk.CTkCheckBox(checks, text=t('moddis_outdated').format(len(outdated), game_version),
+                        variable=self.var_outdated, state="normal" if outdated else "disabled",
+                        command=self._sync).pack(side="left", padx=(16, 4))
+
+        box = ctk.CTkTextbox(self, corner_radius=10, fg_color="#18191D", wrap="none",
+                             font=ctk.CTkFont(family="Consolas", size=12), text_color="#D1D5DB")
+        box.grid(row=2, column=0, padx=14, pady=6, sticky="nsew")
+        box.tag_config("head", foreground=UA_YELLOW)
+        box.tag_config("err", foreground="#F87171")
+        box.tag_config("warn", foreground="#FBBF24")
+        box.tag_config("muted", foreground=COLOR_TEXT_MUTED)
+        if missing:
+            box.insert("end", t('mods_missing_head').format(len(missing)) + "\n", "head")
+            for label, pkg in missing:
+                box.insert("end", f"  ❌ {label}\n", "err")
+                if pkg != label:
+                    box.insert("end", f"       {pkg}\n", "muted")
+            box.insert("end", "\n")
+        if outdated:
+            box.insert("end", t('mods_outdated_head').format(len(outdated), game_version) + "\n", "head")
+            for label, _pkg in outdated:
+                box.insert("end", f"  ⚠ {label}\n", "warn")
+        box.configure(state="disabled")
+        ctk.CTkLabel(self, text=t('moddis_note'), justify="left", wraplength=720, text_color=COLOR_TEXT_MUTED,
+                     font=ctk.CTkFont(family="Segoe UI", size=11)).grid(row=3, column=0, padx=16, pady=(2, 0), sticky="w")
+
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.grid(row=4, column=0, padx=14, pady=(6, 14), sticky="e")
+        self.btn_ok = ctk.CTkButton(bar, text=t('moddis_apply'), height=34, fg_color=COLOR_DANGER,
+                                    hover_color=COLOR_DANGER_HOVER, command=self._ok)
+        self.btn_ok.pack(side="left", padx=4)
+        ctk.CTkButton(bar, text=t('cancel'), width=100, height=34, fg_color="#374151", hover_color="#4B5563",
+                      command=self.destroy).pack(side="left", padx=4)
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.after(50, self._focus)
+
+    def _focus(self):
+        try:
+            self.grab_set()
+            self.focus_set()
+        except Exception:
+            pass
+
+    def _groups(self) -> set:
+        return {g for g, v in (("missing", self.var_missing), ("outdated", self.var_outdated)) if v.get()}
+
+    def _sync(self):
+        self.btn_ok.configure(state="normal" if self._groups() else "disabled")
+
+    def _ok(self):
+        if self._groups():
+            self.result = self._groups()
+            self.destroy()
 
 
 class SaveEditorDialog(ctk.CTkToplevel):
@@ -5293,6 +5426,16 @@ class TruckControlsApp(ctk.CTk):
         if not getattr(self, '_mod_sort_undo', None):
             self.btn_mods_sort_undo.grid_remove()
 
+        # З'являється, лише коли в профілі є увімкнені, але відсутні або застарілі моди
+        self.btn_mods_disable_bad = ctk.CTkButton(
+            filter_row, text=self.t('btn_mods_disable_bad'), height=34,
+            fg_color=COLOR_DANGER, hover_color=COLOR_DANGER_HOVER,
+            command=self.mods_disable_problems
+        )
+        self.btn_mods_disable_bad.grid(row=0, column=4, padx=(8, 0))
+        Tooltip(self.btn_mods_disable_bad, self.t('moddis_tip'))
+        self.btn_mods_disable_bad.grid_remove()
+
         self.txt_mods = ctk.CTkTextbox(
             tab,
             corner_radius=10,
@@ -5734,7 +5877,7 @@ class TruckControlsApp(ctk.CTk):
                 unit = "km"
                 vals["experience"] = self._fmt_int(prof.get('cached_experience'))
                 vals["distance"] = f"{self._fmt_int(prof.get('cached_distance'))} {unit}"
-                vals["mods"] = str(len(prof.get('active_mods') or []))
+                vals["mods"] = str(len(sii_array(prof, 'active_mods')))
                 vals["last_save"] = self._fmt_ts(prof.get('save_time'))
 
             currency = "$" if self.current_game == "American Truck Simulator" else "€"
@@ -7042,7 +7185,7 @@ class TruckControlsApp(ctk.CTk):
         for prof in self.profiles:
             p = self.profile_item_path('profile.sii', prof)
             data = read_sii_file(p) if p else None
-            for entry in (data or {}).get('active_mods', []) or []:
+            for entry in sii_array(data, 'active_mods'):
                 pkg, _, name = entry.partition('|')
                 if not name:
                     continue
@@ -7472,7 +7615,7 @@ class TruckControlsApp(ctk.CTk):
         p = self.profile_item_path('profile.sii', profile)
         data = read_sii_file(p) if p else None
         result = []
-        for entry in (data or {}).get('active_mods', []) or []:
+        for entry in sii_array(data, 'active_mods'):
             pkg, _, name = entry.partition('|')
             result.append((pkg, name or pkg))
         return result
@@ -7607,6 +7750,60 @@ class TruckControlsApp(ctk.CTk):
         self.render_mods_view()
         self.set_status(self.t('modsort_undone'))
 
+    # --- ВИМКНЕННЯ ПРОБЛЕМНИХ МОДІВ ---
+    def mods_disable_problems(self):
+        if self.get_selected_profile_path() is None:
+            messagebox.showinfo("!", self.t('tweak_no_profile'))
+            return
+        mods = getattr(self, 'installed_mods', None)
+        if mods is None:
+            messagebox.showinfo("!", self.t('mods_scanning'))
+            return
+        if is_game_running(self.current_game):
+            messagebox.showwarning(self.t('dlg_warning'), self.t('modsort_game_running'))
+            return
+        active = self._profile_active_mods()
+        # Індекси — позиції записів у profile.sii (active_mods[k])
+        groups = {"missing": [], "outdated": []}
+        for k, (pkg, name) in enumerate(active):
+            if pkg not in mods:
+                groups["missing"].append(k)
+            elif mods[pkg].get('compatible') is False:
+                groups["outdated"].append(k)
+        if not groups["missing"] and not groups["outdated"]:
+            messagebox.showinfo("OK", self.t('mods_no_problems'))
+            return
+        # У списку — як у менеджері модів гри: згори найвищий пріоритет
+        listed = {g: [(self._mod_label(active[k][0], active[k][1]), active[k][0]) for k in reversed(ks)]
+                  for g, ks in groups.items()}
+        dlg = ModDisableDialog(self, self.t, listed["missing"], listed["outdated"], self.game_version)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        remove = {k for g in dlg.result for k in groups[g]}
+        if is_game_running(self.current_game):
+            messagebox.showwarning(self.t('dlg_warning'), self.t('modsort_game_running'))
+            return
+        path = self.profile_item_path('profile.sii')
+        try:
+            if self._profile_active_mods() != active:
+                raise ValueError(self.t('modsort_changed'))
+            raw = path.read_bytes()
+            new = remove_profile_mods(raw, remove)
+            self._backup_config(path)
+            path.write_bytes(new)
+        except Exception as e:
+            messagebox.showerror(self.t('dlg_error'), str(e))
+            return
+        self._mod_sort_undo = (path, raw)
+        self.btn_mods_sort_undo.grid()
+        self.logger.info(f"Disabled {len(remove)} problem mods: {path}")
+        self.render_mods_view()
+        self.refresh_save_slots()
+        self.refresh_profile_card()
+        self.set_status(self.t('moddis_done').format(len(remove)))
+        messagebox.showinfo("OK", self.t('moddis_done_msg').format(len(remove)))
+
     def render_mods_view(self):
         box = self.txt_mods
         box.delete("1.0", "end")
@@ -7631,6 +7828,11 @@ class TruckControlsApp(ctk.CTk):
             len(active), len(mods) - n_ws, n_ws, fmt_size(total),
             len(missing), len(outdated), len(unused), fmt_size(sum(m['size'] for m in unused)))
         self.lbl_mods_summary.configure(text=summary, text_color="#F87171" if missing else COLOR_TEXT_WHITE)
+        if missing or outdated:
+            self.btn_mods_disable_bad.configure(text=self.t('btn_mods_disable_bad_n').format(len(missing) + len(outdated)))
+            self.btn_mods_disable_bad.grid()
+        else:
+            self.btn_mods_disable_bad.grid_remove()
 
         def match(*parts):
             return not kw or any(kw in (p or "").lower() for p in parts)
