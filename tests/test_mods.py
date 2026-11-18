@@ -445,6 +445,37 @@ class RemoveProfileModsTests(unittest.TestCase):
             app.remove_profile_mods(b"BSII\x03\0\0\0", {0})
 
 
+class AddProfileModTests(unittest.TestCase):
+    def mods(self, raw: bytes):
+        return app.sii_array(app.parse_sii_unit(raw.decode()), "active_mods")
+
+    def test_add_goes_to_top_priority(self):
+        out = app.add_profile_mod(PROFILE_SII.encode(), "mod_workshop_package.000000009EA34157", "Мій | мод")
+        self.assertEqual(self.mods(out), ["mod_a|Mod A", "mod_b|Mod B", "mod_c|Mod C",
+                                          "mod_workshop_package.000000009EA34157|Мій / мод"])
+        text = out.decode()
+        self.assertIn(" active_mods: 4\n", text)
+        self.assertIn(' active_mods[3]: "mod_workshop_package.000000009EA34157|', text)
+        self.assertEqual(text.count("\n"), PROFILE_SII.count("\n") + 1)
+        self.assertIn(' profile_name: "Test Driver"', text)
+        # The result must still be a valid layout for removal (enable -> disable = original)
+        self.assertEqual(app.remove_profile_mods(out, {3}), PROFILE_SII.encode())
+
+    def test_add_to_empty_crlf_encrypted(self):
+        empty = app.remove_profile_mods(PROFILE_SII.encode(), [0, 1, 2]).decode().replace("\n", "\r\n")
+        out = app.add_profile_mod(encrypt_scsc(empty.encode()), "my_mod", "")
+        self.assertEqual(self.mods(out), ["my_mod|my_mod"])
+        self.assertNotIn(b"\n", out.replace(b"\r\n", b""))
+
+    def test_errors(self):
+        raw = PROFILE_SII.encode()
+        for pkg in ("mod_b", "", 'bad"name', "a|b"):
+            with self.assertRaises(ValueError, msg=pkg):
+                app.add_profile_mod(raw, pkg, "x")
+        with self.assertRaises(ValueError):
+            app.add_profile_mod(b"BSII\x03\0\0\0", "m", "m")
+
+
 class SiiArrayTests(unittest.TestCase):
     def test_empty_array_is_count_only(self):
         data = app.parse_sii_unit("SiiNunit\n{\nuser_profile : x {\n active_mods: 0\n face: 1\n}\n}\n")

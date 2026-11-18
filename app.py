@@ -1293,6 +1293,30 @@ def remove_profile_mods(raw: bytes, remove) -> bytes:
         raise ValueError("verification failed")
     return out.encode('utf-8')
 
+def add_profile_mod(raw: bytes, pkg: str, name: str) -> bytes:
+    """profile.sii з увімкненим модом `pkg`: запис «pkg|назва» додається в кінець active_mods,
+    тобто на найвищий пріоритет (у менеджері модів гри — нагору, як робить сама гра)."""
+    text, lines, c, n, items = _active_mods_layout(raw)
+    if not re.fullmatch(r'[\w.\-]+', pkg or ""):
+        raise ValueError("bad mod package name")
+    before = sii_array(parse_sii_unit(text), 'active_mods')
+    if any(e.partition('|')[0] == pkg for e in before):
+        raise ValueError("mod is already enabled")
+    def crlf(line):
+        return '\r' if line.endswith('\r') else ''
+    count_indent = _ACTIVE_MODS_COUNT.match(lines[c].rstrip('\r')).group(1)
+    item_indent = items[-1].group(1) if items else count_indent
+    label = (name or pkg).replace('|', '/').replace('\r', ' ').replace('\n', ' ').strip() or pkg
+    entry = f"{pkg}|{label}"
+    block = [f"{count_indent}active_mods: {n + 1}{crlf(lines[c])}"] + lines[c + 1:c + 1 + n]
+    block.append(f'{item_indent}active_mods[{n}]: "{sii_escape(entry)}"{crlf(lines[c])}')
+    new_lines = lines[:c] + block + lines[c + 1 + n:]
+    out = '\n'.join(new_lines)
+    after = sii_array(parse_sii_unit(out), 'active_mods')
+    if after != before + [entry] or new_lines[:c] != lines[:c] or new_lines[c + 2 + n:] != lines[c + 1 + n:]:
+        raise ValueError("verification failed")
+    return out.encode('utf-8')
+
 # ============================================================================
 # РЕДАКТОР СЕЙВІВ: декодер бінарного SII (BSII) і точкове редагування полів
 # ============================================================================
@@ -2743,6 +2767,12 @@ LANGUAGES = {
         "mods_fmt_unknown": "невідомий",
         "btn_mod_reveal": "📂 Показати файл",
         "btn_mod_steam": "🌐 Сторінка в Steam",
+        "btn_mod_disable": "⛔ Вимкнути в профілі",
+        "btn_mod_enable": "✅ Увімкнути в профілі",
+        "modtoggle_disable_confirm": "Вимкнути мод «{}» у профілі «{}»?\n\nФайл мода і підписка лишаються. Перед записом буде бекап profile.sii, а кнопка «↶ Скасувати» поверне як було.",
+        "modtoggle_enable_confirm": "Увімкнути мод «{}» у профілі «{}»?\n\nМод стане нагору списку (найвищий пріоритет), як це робить гра. Порядок можна змінити автосортуванням або в менеджері модів гри. Перед записом буде бекап profile.sii.",
+        "modtoggle_disabled": "⛔ Вимкнено: {}",
+        "modtoggle_enabled": "✅ Увімкнено: {}",
         "btn_mods_add": "➕ Додати мод",
         "modadd_tip": "Скопіювати моди (.scs, .zip або папку з manifest.sii) у папку mod. Файли можна також просто перетягнути у вікно програми.",
         "modadd_title": "Додати моди",
@@ -3419,6 +3449,12 @@ LANGUAGES = {
         "mods_fmt_unknown": "unknown",
         "btn_mod_reveal": "📂 Show file",
         "btn_mod_steam": "🌐 Steam page",
+        "btn_mod_disable": "⛔ Disable in profile",
+        "btn_mod_enable": "✅ Enable in profile",
+        "modtoggle_disable_confirm": "Disable mod «{}» in profile «{}»?\n\nThe mod file and subscription stay. profile.sii is backed up first, and «↶ Undo» restores it.",
+        "modtoggle_enable_confirm": "Enable mod «{}» in profile «{}»?\n\nThe mod goes to the top of the list (highest priority), as the game does it. Change the order with Auto-sort or in the in-game Mod Manager. profile.sii is backed up first.",
+        "modtoggle_disabled": "⛔ Disabled: {}",
+        "modtoggle_enabled": "✅ Enabled: {}",
         "btn_mods_add": "➕ Add mod",
         "modadd_tip": "Copy mods (.scs, .zip or a folder with manifest.sii) into the mod folder. You can also drag files into the app window.",
         "modadd_title": "Add mods",
@@ -6169,6 +6205,8 @@ class TruckControlsApp(ctk.CTk):
         self.btn_mod_steam = ctk.CTkButton(
             btns, text=self.t('btn_mod_steam'), height=30, fg_color=UA_BLUE, hover_color=UA_BLUE_HOVER,
             command=self.mod_open_steam_page)
+        # Увімкнути/вимкнути вибраний мод у профілі (текст і колір — залежно від стану мода)
+        self.btn_mod_toggle = ctk.CTkButton(btns, text="", height=30, command=self.mod_toggle_selected)
         self._mod_info_token = 0
         self._mod_info_cache = {}
         self._mod_info_img = None
@@ -8646,6 +8684,7 @@ class TruckControlsApp(ctk.CTk):
         """Заповнює панель праворуч. Читання архіву і запит до Steam — у фоновому потоці."""
         self._mod_info_token += 1
         token = self._mod_info_token
+        self.btn_mod_toggle.pack_forget()
         self.btn_mod_reveal.pack_forget()
         self.btn_mod_steam.pack_forget()
         # image=None у CTkLabel ламається, якщо стару картинку вже знищено, — тому порожня картинка 1×1
@@ -8660,6 +8699,16 @@ class TruckControlsApp(ctk.CTk):
         pkg, name = key
         m = getattr(self, 'installed_mods', {}).get(pkg)
         ws_id = (m and m.get('ws_id')) or workshop_id_from_package(pkg)
+        if self.get_selected_profile_path() is not None:
+            enabled = any(p == pkg for p, _n in self._profile_active_mods())
+            if enabled:
+                self.btn_mod_toggle.configure(text=self.t('btn_mod_disable'), fg_color=COLOR_DANGER,
+                                              hover_color=COLOR_DANGER_HOVER)
+            else:
+                self.btn_mod_toggle.configure(text=self.t('btn_mod_enable'), fg_color=COLOR_SUCCESS,
+                                              hover_color=COLOR_SUCCESS_HOVER)
+            if enabled or m is not None:
+                self.btn_mod_toggle.pack(side="top", fill="x", padx=4, pady=(0, 6))
         self.mod_info_name.configure(text=self._mod_label(pkg, name), text_color=COLOR_TEXT_WHITE,
                                      font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"))
         if ws_id:
@@ -8773,6 +8822,57 @@ class TruckControlsApp(ctk.CTk):
             box.insert("end", "\n" + note, "muted")
         box.configure(state="disabled")
         box.grid()
+
+    def mod_toggle_selected(self):
+        """Вимикає вибраний мод у профілі або вмикає його (нагору списку, як робить гра).
+        Бекап profile.sii перед записом, «↶ Скасувати» повертає попередній стан."""
+        key = self._selected_mod()
+        if not key:
+            return
+        if self.get_selected_profile_path() is None:
+            messagebox.showinfo("!", self.t('tweak_no_profile'))
+            return
+        if is_game_running(self.current_game):
+            messagebox.showwarning(self.t('dlg_warning'), self.t('modsort_game_running'))
+            return
+        pkg, name = key
+        mods = getattr(self, 'installed_mods', {})
+        active = self._profile_active_mods()
+        idx = [k for k, (p, _n) in enumerate(active) if p == pkg]
+        label = self._mod_label(pkg, name)
+        profile = self.profiles[self.selected_profile_index][2] or self.profiles[self.selected_profile_index][0]
+        if idx:
+            question = self.t('modtoggle_disable_confirm').format(label, profile)
+        elif pkg in mods:
+            question = self.t('modtoggle_enable_confirm').format(label, profile)
+        else:
+            return
+        if not messagebox.askyesno(self.t('dlg_warning'), question):
+            return
+        if is_game_running(self.current_game):
+            messagebox.showwarning(self.t('dlg_warning'), self.t('modsort_game_running'))
+            return
+        path = self.profile_item_path('profile.sii')
+        try:
+            if self._profile_active_mods() != active:
+                raise ValueError(self.t('modsort_changed'))
+            raw = path.read_bytes()
+            if idx:
+                new = remove_profile_mods(raw, idx)
+            else:
+                new = add_profile_mod(raw, pkg, mods[pkg].get('name') or label)
+            self._backup_config(path)
+            path.write_bytes(new)
+        except Exception as e:
+            messagebox.showerror(self.t('dlg_error'), str(e))
+            return
+        self._mod_sort_undo = (path, raw)
+        self.btn_mods_sort_undo.grid()
+        self.logger.info(f"Mod {'disabled' if idx else 'enabled'} in profile: {pkg} ({path})")
+        self.render_mods_view()
+        self.refresh_save_slots()
+        self.refresh_profile_card()
+        self.set_status(self.t('modtoggle_disabled' if idx else 'modtoggle_enabled').format(label))
 
     def mod_reveal_selected(self):
         key = self._selected_mod()
