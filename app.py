@@ -6146,11 +6146,21 @@ class TruckControlsApp(ctk.CTk):
             body, text="", font=ctk.CTkFont(family="Segoe UI", size=12),
             text_color=COLOR_TEXT_MUTED, justify="left", anchor="w")
         self.lbl_mods_view_head.grid(row=0, column=0, padx=4, pady=(0, 4), sticky="ew")
-        self.lbl_mods_view_head.bind(
-            "<Configure>", lambda e: self.lbl_mods_view_head.configure(wraplength=max(200, e.width - 8)))
 
         table = ctk.CTkFrame(body, corner_radius=10, fg_color="#18191D")
         table.grid(row=1, column=0, sticky="nsew")
+
+        # Ширина переносу — від таблиці, а не від самого підпису: інакше підпис розширюється, знову
+        # отримує <Configure>, і цикл не закінчується (програма зависає). CTk множить wraplength
+        # на масштаб екрана, тому ділимо на нього.
+        self._mods_head_wrap = 0
+
+        def wrap_head(e):
+            w = int(max(200, e.width - 40) / self.lbl_mods_view_head._get_widget_scaling())
+            if abs(w - self._mods_head_wrap) > 4:
+                self._mods_head_wrap = w
+                self.lbl_mods_view_head.configure(wraplength=w)
+        table.bind("<Configure>", wrap_head)
         table.grid_columnconfigure(0, weight=1)
         table.grid_rowconfigure(0, weight=1)
 
