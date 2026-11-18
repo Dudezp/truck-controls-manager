@@ -22,6 +22,69 @@ def encrypt_scsc(plain: bytes) -> bytes:
     return app.SCSC_MAGIC + b"\0" * 32 + iv + struct.pack("<I", len(plain)) + enc
 
 
+def _hashfs_tree(files: dict) -> dict:
+    """{dir path: (subdirs, file names)} for every directory implied by the file paths ('' is the root)."""
+    tree = {"": (set(), set())}
+    for path in files:
+        parts = path.split("/")
+        for i in range(len(parts) - 1):
+            parent, child = "/".join(parts[:i]), "/".join(parts[:i + 1])
+            tree.setdefault(child, (set(), set()))
+            tree[parent][0].add(parts[i])
+        tree["/".join(parts[:-1])][1].add(parts[-1])
+    return tree
+
+
+def build_hashfs_v1(files: dict, compress=True) -> bytes:
+    """HashFS v1 archive (SCS#, version 1) with the given {path: bytes}, directory listings included."""
+    items = []   # (hash, data, flags, size)
+    for d, (subdirs, names) in _hashfs_tree(files).items():
+        listing = "\n".join(["*" + s for s in sorted(subdirs)] + sorted(names)).encode()
+        items.append((d, listing, True))
+    items += [(p, data, False) for p, data in files.items()]
+    header_size, table = 4096, []
+    body = b""
+    for path, data, is_dir in items:
+        stored = zlib.compress(data) if compress else data
+        flags = (1 if is_dir else 0) | (2 if compress else 0)
+        table.append(struct.pack("<QQIIII", app.cityhash64(path.encode()), header_size + len(body),
+                                 flags, zlib.crc32(data), len(data), len(stored)))
+        body += stored
+    start = header_size + len(body)
+    head = struct.pack("<4sHH4sII", b"SCS#", 1, 0, b"CITY", len(items), start)
+    return head.ljust(header_size, b"\0") + body + b"".join(table)
+
+
+def build_hashfs_v2(files: dict) -> bytes:
+    """HashFS v2 archive (SCS#, version 2): zlib entry and metadata tables, 16-byte aligned data."""
+    items = []
+    for d, (subdirs, names) in _hashfs_tree(files).items():
+        entries = ["/" + s for s in sorted(subdirs)] + sorted(names)
+        listing = struct.pack("<I", len(entries)) + bytes(len(e.encode()) for e in entries) + \
+            b"".join(e.encode() for e in entries)
+        items.append((d, listing, True))
+    items += [(p, data, False) for p, data in files.items()]
+    body, entry_table, meta = b"", b"", []
+    base = 64
+    for path, data, is_dir in items:
+        stored = zlib.compress(data)
+        offset = base + len(body)
+        body += stored + b"\0" * (-len(stored) % 16)
+        midx = len(meta)
+        meta.append(((0x81 if is_dir else 0x80) << 24) | (midx + 1))
+        plain = len(stored).to_bytes(3, "little") + bytes([0x10]) + len(data).to_bytes(3, "little") + b"\0" + \
+            b"\0" * 4 + struct.pack("<I", offset // 16)
+        meta += list(struct.unpack("<4I", plain))
+        entry_table += struct.pack("<QIHBB", app.cityhash64(path.encode()), midx, 1, 1 if is_dir else 0, 0)
+    et = zlib.compress(entry_table)
+    mt = zlib.compress(struct.pack(f"<{len(meta)}I", *meta))
+    estart = base + len(body)
+    mstart = estart + len(et)
+    head = struct.pack("<4sHH4sIIIIQQQB", b"SCS#", 2, 0, b"CITY", len(items), len(et), len(meta), len(mt),
+                       estart, mstart, 0, 0)
+    return head.ljust(base, b"\0") + body + et + mt
+
+
 def encode_token(s: str) -> int:
     """Inverse of app.decode_token."""
     v = 0

@@ -5,7 +5,7 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
-from helpers import app, encrypt_scsc, PROFILE_SII, MANIFEST_SII
+from helpers import app, encrypt_scsc, build_hashfs_v1, build_hashfs_v2, PROFILE_SII, MANIFEST_SII
 
 
 def make_zip(path: Path, files: dict):
@@ -59,6 +59,115 @@ class ManifestTests(unittest.TestCase):
         make_zip(ws / "latest.zip", {"manifest.sii": MANIFEST_SII.replace(
             "\\xd0\\x9c\\xd1\\x96\\xd0\\xb9 \\xd0\\xbc\\xd0\\xbe\\xd0\\xb4", "New")})
         self.assertEqual(app.read_mod_display_name(ws), "New")
+
+
+FULL_MANIFEST = MANIFEST_SII.replace(
+    ' category[]: "truck"',
+    ' author: "Автор"\n icon: "mod_icon.jpg"\n description_file: "mod_description.txt"\n'
+    ' compatible_versions[]: "1.62.*"\n category[]: "truck"')
+LONG_PATH = "def/vehicle/truck/some_brand.some_model/accessory/very_long_folder_name/item.sii"
+
+
+class CityHashTests(unittest.TestCase):
+    def test_matches_real_hashfs_paths(self):
+        # Hashes taken from a real HashFS v1 mod archive: one string per length branch of CityHash64
+        cases = {
+            "": 0x9ae16a3b2f90404f,
+            "def": 0x2c6f469efb31c45a,
+            "automat": 0x56bc42eecbc73f2f,
+            "actros_mp6": 0xe0ea01884705607f,
+            "unit/hookup/vehicle": 0x43374764a0f107f8,
+            "unit/hookup/vehicle/flare/blinker_led.sui": 0xef2fcb301ac4111d,
+            "unit/hookup/vehicle/flare/vehicle_spot_end_outline_front_white.sui": 0x2ea77845c7c4363,
+        }
+        for s, h in cases.items():
+            self.assertEqual(app.cityhash64(s.encode()), h, s)
+
+
+class HashFSTests(unittest.TestCase):
+    FILES = {
+        "manifest.sii": FULL_MANIFEST.encode(),
+        "mod_icon.jpg": b"\xff\xd8JPEG",
+        "mod_description.txt": "Опис мода\n".encode("utf-8"),
+        "def/a.sii": b"x" * 1000,
+        LONG_PATH: b"long",
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def check_archive(self, path, version):
+        self.assertEqual(app.mod_archive_kind(path), f"hashfs{version}")
+        with app.HashFSReader(path) as h:
+            self.assertEqual(h.version, version)
+            for name, data in self.FILES.items():
+                self.assertEqual(h.read(name), data, name)
+                self.assertEqual(h.read("/" + name), data, name)
+            self.assertIsNone(h.read("nope.txt"))
+            self.assertIsNone(h.read("def"))          # directory, not a file
+            dirs, files = h.listdir("")
+            self.assertEqual(sorted(dirs), ["def"])
+            self.assertIn("manifest.sii", files)
+            self.assertEqual(h.listdir("def")[0], ["vehicle"])
+            self.assertEqual(h.listdir("missing"), ([], []))
+        info = app.read_mod_info(path)
+        self.assertEqual(info["display_name"], "Мій мод")
+        self.assertEqual(info["author"], "Автор")
+        self.assertEqual(info["package_version"], "1.0")
+        self.assertEqual(info["categories"], ["truck", "paint_job"])
+        self.assertEqual(info["compatible_versions"], ["1.62.*"])
+        self.assertEqual(info["icon"], b"\xff\xd8JPEG")
+        self.assertEqual(info["description"], "Опис мода")
+        self.assertEqual(app.read_mod_display_name(path), "Мій мод")
+        self.assertEqual(app.read_mod_categories(path), ["truck", "paint_job"])
+
+    def test_v1_compressed_and_stored(self):
+        p = self.dir / "v1.scs"
+        p.write_bytes(build_hashfs_v1(self.FILES))
+        self.check_archive(p, 1)
+        p2 = self.dir / "v1raw.scs"
+        p2.write_bytes(build_hashfs_v1(self.FILES, compress=False))
+        self.check_archive(p2, 1)
+
+    def test_v2(self):
+        p = self.dir / "v2.scs"
+        p.write_bytes(build_hashfs_v2(self.FILES))
+        self.check_archive(p, 2)
+
+    def test_broken_and_other_formats(self):
+        bad = self.dir / "bad.scs"
+        bad.write_bytes(b"SCS#\x02\x00\x00\x00CITY" + b"\xff" * 60)
+        with self.assertRaises(app.HashFSError):
+            app.HashFSReader(bad)
+        self.assertIsNone(app.open_mod_archive(bad))
+        self.assertIsNone(app.read_mod_display_name(bad))
+        enc = self.dir / "enc.scs"
+        enc.write_bytes(b"AEM!" + b"\0" * 50)
+        self.assertEqual(app.mod_archive_kind(enc), "encrypted")
+        self.assertEqual(app.read_mod_info(enc)["kind"], "encrypted")
+        self.assertEqual(app.mod_archive_kind(self.dir), "folder")
+
+    def test_cp1251_description_and_zip_info(self):
+        z = self.dir / "m.zip"
+        make_zip(z, {"manifest.sii": FULL_MANIFEST, "MOD_ICON.JPG": b"img",
+                     "mod_description.txt": "Опис".encode("cp1251")})
+        info = app.read_mod_info(z)
+        self.assertEqual(info["kind"], "zip")
+        self.assertEqual(info["icon"], b"img")         # імена в ZIP без урахування регістру
+        self.assertEqual(info["description"], "Опис")
+
+    def test_workshop_hashfs_version(self):
+        ws = self.dir / "777"
+        ws.mkdir()
+        (ws / "universal.scs").write_bytes(build_hashfs_v2(self.FILES))
+        info = app.read_mod_info(ws)
+        self.assertEqual(info["kind"], "hashfs2")
+        self.assertEqual(info["source_file"], ws / "universal.scs")
+        self.assertEqual(info["display_name"], "Мій мод")
 
 
 class ScanInstalledModsTests(unittest.TestCase):

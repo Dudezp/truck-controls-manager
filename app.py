@@ -411,66 +411,385 @@ def read_workshop_sizes(workshop_dir: Path, game_name: str) -> dict:
     except Exception:
         return {}
 
-def _manifest_display_name(raw: bytes) -> str | None:
+# ============================================================================
+# АРХІВИ МОДІВ: ZIP, HashFS v1/v2 (власний формат SCS) і розпаковані папки
+# ============================================================================
+_M64 = (1 << 64) - 1
+_CH_K0, _CH_K1, _CH_K2, _CH_K3 = 0xc3a5c85c97cb3127, 0xb492b66fbe98f273, 0x9ae16a3b2f90404f, 0xc949d7c7509e6557
+_CH_KMUL = 0x9ddfea08eb382d69
+
+def _ch_f64(s, i):
+    return int.from_bytes(s[i:i + 8], 'little')
+
+def _ch_f32(s, i):
+    return int.from_bytes(s[i:i + 4], 'little')
+
+def _ch_rot(v, n):
+    return v if n == 0 else ((v >> n) | (v << (64 - n))) & _M64
+
+def _ch_smix(v):
+    return v ^ (v >> 47)
+
+def _ch_h16(u, v, mul=_CH_KMUL):
+    a = ((u ^ v) * mul) & _M64
+    a ^= a >> 47
+    b = ((v ^ a) * mul) & _M64
+    b ^= b >> 47
+    return (b * mul) & _M64
+
+def _ch_weak32(s, i, a, b):
+    w, x, y, z = _ch_f64(s, i), _ch_f64(s, i + 8), _ch_f64(s, i + 16), _ch_f64(s, i + 24)
+    a = (a + w) & _M64
+    b = _ch_rot((b + a + z) & _M64, 21)
+    c = a
+    a = (a + x + y) & _M64
+    b = (b + _ch_rot(a, 44)) & _M64
+    return (a + z) & _M64, (b + c) & _M64
+
+def cityhash64(s: bytes) -> int:
+    """CityHash64 у тому вигляді, яким SCS хешує шляхи в HashFS: рядки до 64 байт — як у CityHash 1.0.3,
+    довші — як у 1.1 (перевірено на всіх шляхах реальних архівів v1 і v2)."""
+    n = len(s)
+    if n <= 16:
+        if n > 8:
+            b = _ch_f64(s, n - 8)
+            return _ch_h16(_ch_f64(s, 0), _ch_rot((b + n) & _M64, n)) ^ b
+        if n >= 4:
+            return _ch_h16((n + (_ch_f32(s, 0) << 3)) & _M64, _ch_f32(s, n - 4))
+        if n > 0:
+            y = s[0] + (s[n >> 1] << 8)
+            z = n + (s[n - 1] << 2)
+            return (_ch_smix(((y * _CH_K2) ^ (z * _CH_K3)) & _M64) * _CH_K2) & _M64
+        return _CH_K2
+    if n <= 32:
+        a = (_ch_f64(s, 0) * _CH_K1) & _M64
+        b = _ch_f64(s, 8)
+        c = (_ch_f64(s, n - 8) * _CH_K2) & _M64
+        d = (_ch_f64(s, n - 16) * _CH_K0) & _M64
+        return _ch_h16((_ch_rot((a - b) & _M64, 43) + _ch_rot(c, 30) + d) & _M64,
+                       (a + _ch_rot(b ^ _CH_K3, 20) - c + n) & _M64)
+    if n <= 64:
+        z = _ch_f64(s, 24)
+        a = (_ch_f64(s, 0) + (n + _ch_f64(s, n - 16)) * _CH_K0) & _M64
+        b = _ch_rot((a + z) & _M64, 52)
+        c = _ch_rot(a, 37)
+        a = (a + _ch_f64(s, 8)) & _M64
+        c = (c + _ch_rot(a, 7)) & _M64
+        a = (a + _ch_f64(s, 16)) & _M64
+        vf, vs = (a + z) & _M64, (b + _ch_rot(a, 31) + c) & _M64
+        a = (_ch_f64(s, 16) + _ch_f64(s, n - 32)) & _M64
+        z = _ch_f64(s, n - 8)
+        b = _ch_rot((a + z) & _M64, 52)
+        c = _ch_rot(a, 37)
+        a = (a + _ch_f64(s, n - 24)) & _M64
+        c = (c + _ch_rot(a, 7)) & _M64
+        a = (a + _ch_f64(s, n - 16)) & _M64
+        wf, ws = (a + z) & _M64, (b + _ch_rot(a, 31) + c) & _M64
+        r = _ch_smix(((vf + ws) * _CH_K2 + (wf + vs) * _CH_K0) & _M64)
+        return (_ch_smix((r * _CH_K0 + vs) & _M64) * _CH_K2) & _M64
+    x = _ch_f64(s, n - 40)
+    y = (_ch_f64(s, n - 16) + _ch_f64(s, n - 56)) & _M64
+    z = _ch_h16((_ch_f64(s, n - 48) + n) & _M64, _ch_f64(s, n - 24))
+    v = _ch_weak32(s, n - 64, n, z)
+    w = _ch_weak32(s, n - 32, (y + _CH_K1) & _M64, x)
+    x = (x * _CH_K1 + _ch_f64(s, 0)) & _M64
+    for p in range(0, (n - 1) & ~63, 64):
+        x = (_ch_rot((x + y + v[0] + _ch_f64(s, p + 8)) & _M64, 37) * _CH_K1) & _M64
+        y = (_ch_rot((y + v[1] + _ch_f64(s, p + 48)) & _M64, 42) * _CH_K1) & _M64
+        x ^= w[1]
+        y = (y + v[0] + _ch_f64(s, p + 40)) & _M64
+        z = (_ch_rot((z + w[0]) & _M64, 33) * _CH_K1) & _M64
+        v = _ch_weak32(s, p, (v[1] * _CH_K1) & _M64, (x + w[0]) & _M64)
+        w = _ch_weak32(s, p + 32, (z + w[1]) & _M64, (y + _ch_f64(s, p + 16)) & _M64)
+        z, x = x, z
+    return _ch_h16((_ch_h16(v[0], w[0]) + _ch_smix(y) * _CH_K1 + z) & _M64, (_ch_h16(v[1], w[1]) + x) & _M64)
+
+HASHFS_MAGIC = b'SCS#'
+
+class HashFSError(Exception):
+    pass
+
+class HashFSReader:
+    """Читання архіву HashFS (.scs) версій 1 і 2 без розпакування: з диска беруться лише заголовок,
+    таблиці записів і потрібні файли. Шляхи — без початкового «/», корінь — ''."""
+    MAX_FILE = 32 * 1024 * 1024    # більші файли (текстури, моделі) тут не потрібні
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.f = open(self.path, 'rb')
+        try:
+            self._parse()
+        except Exception as e:
+            self.f.close()
+            raise HashFSError(f"{self.path.name}: {e}") from None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        self.f.close()
+
+    def _read_at(self, offset, size):
+        self.f.seek(offset)
+        data = self.f.read(size)
+        if len(data) != size:
+            raise HashFSError("unexpected end of file")
+        return data
+
+    def _parse(self):
+        head = self._read_at(0, 52)
+        magic, self.version, self.salt = struct.unpack_from('<4sHH', head, 0)
+        if magic != HASHFS_MAGIC or head[8:12] != b'CITY':
+            raise HashFSError("not a HashFS archive")
+        self.entries = {}
+        if self.version == 1:
+            count, start = struct.unpack_from('<II', head, 12)
+            table = self._read_at(start, count * 32)
+            for i in range(count):
+                h, off, flags, _crc, size, csize = struct.unpack_from('<QQIIII', table, i * 32)
+                # (зміщення, розмір у архіві, розмір, стиснуто, тека)
+                self.entries[h] = (off, csize, size, bool(flags & 2), bool(flags & 1))
+        elif self.version == 2:
+            ecount, ecsize, _mcount, mcsize, estart, mstart = struct.unpack_from('<IIIIQQ', head, 12)
+            et = zlib.decompress(self._read_at(estart, ecsize))
+            mt = zlib.decompress(self._read_at(mstart, mcsize))
+            for i in range(ecount):
+                h, midx, mcnt, flags, _pad = struct.unpack_from('<QIHBB', et, i * 16)
+                plain = None
+                for j in range(mcnt):
+                    item = struct.unpack_from('<I', mt, (midx + j) * 4)[0]
+                    if item >> 24 in (0x80, 0x81):          # звичайний файл / тека
+                        m = (item & 0xFFFFFF) * 4
+                        plain = mt[m:m + 16]
+                if plain is None or len(plain) < 16:
+                    continue                                 # текстури (.tobj) тощо — інший тип даних
+                csize = int.from_bytes(plain[0:3], 'little')
+                size = int.from_bytes(plain[4:7], 'little')
+                off = struct.unpack_from('<I', plain, 12)[0] * 16
+                self.entries[h] = (off, csize, size, (plain[3] >> 4) != 0, bool(flags & 1))
+        else:
+            raise HashFSError(f"unsupported HashFS version {self.version}")
+
+    def _hash(self, path: str) -> int:
+        path = path.strip('/')
+        if self.salt:
+            path = str(self.salt) + path
+        return cityhash64(path.encode('utf-8'))
+
+    def _entry(self, path: str):
+        return self.entries.get(self._hash(path))
+
+    def has(self, path: str) -> bool:
+        e = self._entry(path)
+        return e is not None and not e[4]
+
+    def read(self, path: str) -> bytes | None:
+        """Вміст файлу або None, якщо його немає, це тека, він завеликий чи не розпаковується."""
+        e = self._entry(path)
+        if e is None or e[4]:
+            return None
+        return self._data(e)
+
+    def _data(self, e) -> bytes | None:
+        off, csize, size, compressed, _is_dir = e
+        if csize > self.MAX_FILE or size > self.MAX_FILE:
+            return None
+        try:
+            raw = self._read_at(off, csize)
+            return zlib.decompress(raw) if compressed else raw
+        except Exception:
+            return None
+
+    def listdir(self, path: str = '') -> tuple:
+        """(теки, файли) у теці архіву; ([], []), якщо теки немає."""
+        e = self._entry(path)
+        raw = self._data(e) if e is not None and e[4] else None
+        if raw is None:
+            return [], []
+        dirs, files = [], []
+        if self.version == 1:
+            for name in raw.decode('utf-8', errors='replace').split('\n'):
+                if name.startswith('*'):
+                    dirs.append(name[1:])
+                elif name:
+                    files.append(name)
+        else:
+            n = struct.unpack_from('<I', raw, 0)[0]
+            p = 4 + n
+            for length in raw[4:4 + n]:
+                name = raw[p:p + length].decode('utf-8', errors='replace')
+                p += length
+                (dirs if name.startswith('/') else files).append(name.lstrip('/'))
+        return dirs, files
+
+class _ZipModArchive:
+    def __init__(self, path):
+        self.zf = zipfile.ZipFile(path)
+        self.names = {n.replace('\\', '/').lstrip('./').lower(): n for n in self.zf.namelist()}
+
+    def read(self, name: str) -> bytes | None:
+        real = self.names.get(name.strip('/').lower())
+        if real is None:
+            return None
+        info = self.zf.getinfo(real)
+        if info.file_size > HashFSReader.MAX_FILE:
+            return None
+        return self.zf.read(real)
+
+    def close(self):
+        self.zf.close()
+
+class _DirModArchive:
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def read(self, name: str) -> bytes | None:
+        f = self.path / name.strip('/')
+        try:
+            if f.is_file() and f.stat().st_size <= HashFSReader.MAX_FILE:
+                return f.read_bytes()
+        except OSError:
+            pass
+        return None
+
+    def close(self):
+        pass
+
+def mod_archive_kind(path: Path) -> str:
+    """'folder', 'zip', 'hashfs1', 'hashfs2', 'encrypted' (захищений мод, напр. «AEM!»), 'unknown'."""
+    try:
+        if path.is_dir():
+            return 'folder'
+        with open(path, 'rb') as fh:
+            head = fh.read(6)
+        if head[:4] == HASHFS_MAGIC:
+            return f"hashfs{struct.unpack('<H', head[4:6])[0]}"
+        if zipfile.is_zipfile(path):
+            return 'zip'
+        return 'encrypted' if len(head) >= 4 else 'unknown'
+    except OSError:
+        return 'unknown'
+
+def open_mod_archive(path: Path):
+    """Об'єкт з read(ім'я) -> bytes | None і close() для папки, ZIP або HashFS; None — не читається."""
+    kind = mod_archive_kind(path)
+    try:
+        if kind == 'folder':
+            return _DirModArchive(path)
+        if kind == 'zip':
+            return _ZipModArchive(path)
+        if kind.startswith('hashfs'):
+            return HashFSReader(path)
+    except Exception:
+        pass
+    return None
+
+def _workshop_rank(p: Path):
+    # Workshop: latest / NNN_content / universal та архіви в них — найновіші першими
+    m = re.match(r'(\d+)_content', p.stem)
+    return (p.stem == 'latest', int(m.group(1)) if m else -1, p.stem == 'universal')
+
+def mod_archive_candidates(path: Path) -> list:
+    """Архіви/папки, у яких шукати manifest.sii: сам мод або (Workshop) його версії, найновіші першими."""
+    try:
+        if path.is_file() or (path / 'manifest.sii').is_file():
+            return [path]
+        return [sub for sub in sorted(path.iterdir(), key=_workshop_rank, reverse=True)
+                if sub.suffix.lower() in ('.zip', '.scs') and sub.is_file()
+                or sub.is_dir() and (sub / 'manifest.sii').is_file()]
+    except OSError:
+        return []
+
+def _decode_mod_text(raw: bytes) -> str:
     if raw[:4] == SCSC_MAGIC:
         raw = _decrypt_scsc(raw) or b''
-    name = parse_sii_unit(raw.decode('utf-8', errors='ignore')).get('display_name')
-    if name and not name.startswith('@@'):
-        return name.strip()
-    return None
+    try:
+        return raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        return raw.decode('cp1251', errors='replace')    # старі моди часто в cp1251
+
+def _parse_mod_manifest(raw: bytes) -> dict:
+    data = parse_sii_unit(_decode_mod_text(raw))
+    def as_list(v):
+        return [x.strip() for x in (v if isinstance(v, list) else [v] if v else []) if x and x.strip()]
+    name = (data.get('display_name') or "").strip()
+    return {
+        'display_name': name if name and not name.startswith('@@') else None,
+        'package_version': (data.get('package_version') or "").strip() or None,
+        'author': (data.get('author') or "").strip() or None,
+        'categories': [c.lower() for c in as_list(data.get('category'))],
+        'compatible_versions': as_list(data.get('compatible_versions')),
+        'icon': (data.get('icon') or "").strip() or None,
+        'description_file': (data.get('description_file') or "").strip() or None,
+        'mp_mod_optional': data.get('mp_mod_optional'),
+    }
+
+_MANIFEST_CACHE = {}
+
+def read_mod_manifests(path: Path) -> list:
+    """[(архів/папка, поля manifest.sii)] для всіх версій мода, найновіші першими (кешується за mtime)."""
+    out = []
+    for cand in mod_archive_candidates(path):
+        try:
+            st = cand.stat()
+            key = (str(cand), st.st_mtime_ns, st.st_size)
+        except OSError:
+            continue
+        if key not in _MANIFEST_CACHE:
+            arc, man = open_mod_archive(cand), None
+            if arc is not None:
+                try:
+                    raw = arc.read('manifest.sii')
+                    man = _parse_mod_manifest(raw) if raw else None
+                except Exception:
+                    man = None
+                finally:
+                    arc.close()
+            _MANIFEST_CACHE[key] = man
+        if _MANIFEST_CACHE[key] is not None:
+            out.append((cand, _MANIFEST_CACHE[key]))
+    return out
 
 def read_mod_display_name(path: Path) -> str | None:
-    """display_name з manifest.sii мода: папка, .zip/.scs (ZIP) або папка Workshop з версіями."""
-    try:
-        if path.is_file():
-            if zipfile.is_zipfile(path):
-                with zipfile.ZipFile(path) as zf:
-                    if 'manifest.sii' in zf.namelist():
-                        return _manifest_display_name(zf.read('manifest.sii'))
-            return None
-        if (path / 'manifest.sii').is_file():
-            return _manifest_display_name((path / 'manifest.sii').read_bytes())
-        # Workshop: latest / NNN_content / universal та архіви в них — найновіші першими
-        def rank(p):
-            m = re.match(r'(\d+)_content', p.stem)
-            return (p.stem == 'latest', int(m.group(1)) if m else -1, p.stem == 'universal')
-        for sub in sorted(path.iterdir(), key=rank, reverse=True):
-            if sub.suffix.lower() in ('.zip', '.scs') or sub.is_dir():
-                name = read_mod_display_name(sub) if sub.is_file() or (sub / 'manifest.sii').is_file() else None
-                if name:
-                    return name
-    except Exception:
-        pass
-    return None
+    """display_name з manifest.sii мода: папка, .zip/.scs (ZIP або HashFS) або папка Workshop з версіями."""
+    return next((m['display_name'] for _c, m in read_mod_manifests(path) if m['display_name']), None)
 
 def read_mod_categories(path: Path) -> list:
-    """category[] з manifest.sii мода (ті самі місця пошуку, що й read_mod_display_name).
-    Архіви HashFS (.scs не у форматі ZIP) без розпакування не читаються — тоді []."""
-    def from_raw(raw):
-        if raw[:4] == SCSC_MAGIC:
-            raw = _decrypt_scsc(raw) or b''
-        cats = parse_sii_unit(raw.decode('utf-8', errors='ignore')).get('category') or []
-        return [c.strip().lower() for c in (cats if isinstance(cats, list) else [cats]) if c.strip()]
+    """category[] з manifest.sii мода (ті самі місця пошуку, що й read_mod_display_name)."""
+    return next((m['categories'] for _c, m in read_mod_manifests(path) if m['categories']), [])
+
+def read_mod_info(path: Path) -> dict:
+    """Усе для панелі інформації: поля manifest.sii, іконка (байти), опис, формат архіву.
+    Для Workshop — з найновішої версії, у якій є manifest.sii."""
+    cands = mod_archive_candidates(path)
+    info = {'kind': mod_archive_kind(cands[0]) if cands else ('folder' if path.is_dir() else mod_archive_kind(path)),
+            'display_name': None, 'package_version': None, 'author': None, 'categories': [],
+            'compatible_versions': [], 'icon': None, 'description': None, 'source_file': None}
+    mans = read_mod_manifests(path)
+    if not mans:
+        return info
+    cand, man = mans[0]
+    info.update({k: man[k] for k in ('display_name', 'package_version', 'author', 'categories', 'compatible_versions')})
+    info['kind'] = mod_archive_kind(cand)
+    info['source_file'] = cand
+    arc = open_mod_archive(cand)
+    if arc is None:
+        return info
     try:
-        if path.is_file():
-            if zipfile.is_zipfile(path):
-                with zipfile.ZipFile(path) as zf:
-                    if 'manifest.sii' in zf.namelist():
-                        return from_raw(zf.read('manifest.sii'))
-            return []
-        if (path / 'manifest.sii').is_file():
-            return from_raw((path / 'manifest.sii').read_bytes())
-        def rank(p):
-            m = re.match(r'(\d+)_content', p.stem)
-            return (p.stem == 'latest', int(m.group(1)) if m else -1, p.stem == 'universal')
-        for sub in sorted(path.iterdir(), key=rank, reverse=True):
-            if sub.suffix.lower() in ('.zip', '.scs') or (sub.is_dir() and (sub / 'manifest.sii').is_file()):
-                cats = read_mod_categories(sub)
-                if cats:
-                    return cats
+        if man['icon']:
+            info['icon'] = arc.read(man['icon'])
+        if man['description_file']:
+            raw = arc.read(man['description_file'])
+            if raw:
+                info['description'] = _decode_mod_text(raw).strip()
     except Exception:
         pass
-    return []
+    finally:
+        arc.close()
+    return info
 
 def workshop_compatible(path: Path, game_version: str) -> bool | None:
     """Чи має мод Workshop версію для поточної гри (versions.sii). None — невідомо."""
